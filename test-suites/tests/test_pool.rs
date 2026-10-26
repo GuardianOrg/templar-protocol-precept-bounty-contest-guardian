@@ -1,0 +1,1065 @@
+#![cfg(test)]
+
+use pool::{Request, RequestType, ReserveEmissionMetadata};
+use sep_40_oracle::testutils::Asset;
+use soroban_fixed_point_math::FixedPoint;
+use soroban_sdk::{
+    testutils::{Address as _, AuthorizedFunction, AuthorizedInvocation, Events},
+    vec,
+    xdr::{ScErrorCode, ScErrorType},
+    Address, Error, IntoVal, String, Symbol, Val,
+};
+use test_suites::{
+    assertions::assert_approx_eq_abs,
+    create_fixture_with_data,
+    oracle::create_mock_oracle,
+    pool::default_reserve_metadata,
+    test_fixture::{TestFixture, TokenIndex, SCALAR_12, SCALAR_7},
+};
+
+/// Test user exposed functions on the lending pool for basic user functionality, auth, and events.
+/// Does not test internal state management of the lending pool, only external effects.
+#[test]
+fn test_pool_user() {
+    let fixture = create_fixture_with_data(false);
+    let pool_fixture = &fixture.pools[0];
+    let xlm_pool_index = pool_fixture.reserves[&TokenIndex::XLM];
+    let weth_pool_index = pool_fixture.reserves[&TokenIndex::WETH];
+    let xlm = &fixture.tokens[TokenIndex::XLM];
+    let weth = &fixture.tokens[TokenIndex::WETH];
+    let weth_scalar: i128 = 10i128.pow(weth.decimals());
+
+    let sam = Address::generate(&fixture.env);
+
+    // Mint sam tokens
+    let mut sam_xlm_balance = 10_000 * SCALAR_7;
+    let mut sam_weth_balance = 1 * weth_scalar;
+    xlm.mint(&sam, &sam_xlm_balance);
+    weth.mint(&sam, &sam_weth_balance);
+
+    let mut pool_xlm_balance = xlm.balance(&pool_fixture.pool.address);
+    let mut pool_weth_balance = weth.balance(&pool_fixture.pool.address);
+
+    let mut sam_xlm_btoken_balance = 0;
+    let mut sam_weth_btoken_balance = 0;
+    let mut sam_weth_dtoken_balance = 0;
+
+    // Sam supply WETH
+    let amount = 5 * (weth_scalar / 10); // 0.5
+    let requests = vec![
+        &fixture.env,
+        Request {
+            request_type: RequestType::Supply as u32,
+            address: weth.address.clone(),
+            amount,
+        },
+    ];
+    weth.approve(
+        &sam,
+        &pool_fixture.pool.address,
+        &amount,
+        &fixture.env.ledger().sequence(),
+    );
+    assert_eq!(weth.allowance(&sam, &pool_fixture.pool.address), amount);
+    let result = pool_fixture
+        .pool
+        .submit_with_allowance(&sam, &sam, &sam, &requests);
+    assert_eq!(
+        fixture.env.auths()[0],
+        (
+            sam.clone(),
+            AuthorizedInvocation {
+                function: AuthorizedFunction::Contract((
+                    pool_fixture.pool.address.clone(),
+                    Symbol::new(&fixture.env, "submit_with_allowance"),
+                    vec![
+                        &fixture.env,
+                        sam.to_val(),
+                        sam.to_val(),
+                        sam.to_val(),
+                        requests.to_val()
+                    ]
+                )),
+                sub_invocations: std::vec![]
+            }
+        )
+    );
+    let events = fixture.env.events().all();
+    let event = vec![&fixture.env, events.get_unchecked(events.len() - 2)];
+    let event_data: soroban_sdk::Vec<Val> = vec![
+        &fixture.env,
+        amount.into_val(&fixture.env),
+        result
+            .supply
+            .get_unchecked(weth_pool_index)
+            .into_val(&fixture.env),
+    ];
+    assert_eq!(
+        event,
+        vec![
+            &fixture.env,
+            (
+                pool_fixture.pool.address.clone(),
+                (
+                    Symbol::new(&fixture.env, "supply"),
+                    weth.address.clone(),
+                    sam.clone()
+                )
+                    .into_val(&fixture.env),
+                event_data.into_val(&fixture.env)
+            )
+        ]
+    );
+    let reserve_data = fixture.read_reserve_data(0, TokenIndex::WETH);
+    pool_weth_balance += amount;
+    sam_weth_balance -= amount;
+    assert_eq!(weth.balance(&sam), sam_weth_balance);
+    assert_eq!(weth.balance(&pool_fixture.pool.address), pool_weth_balance);
+    assert_eq!(weth.allowance(&sam, &pool_fixture.pool.address), 0);
+    sam_weth_btoken_balance += amount
+        .fixed_div_floor(reserve_data.b_rate, SCALAR_12)
+        .unwrap();
+    assert_approx_eq_abs(
+        result.supply.get_unchecked(weth_pool_index),
+        sam_weth_btoken_balance,
+        10,
+    );
+
+    // Skip 1 day
+    fixture.jump(24 * 60 * 60);
+
+    // Sam withdraw WETH
+    let amount = 5 * (weth_scalar / 10); // 0.5
+    let requests = vec![
+        &fixture.env,
+        Request {
+            request_type: RequestType::Withdraw as u32,
+            address: weth.address.clone(),
+            amount,
+        },
+    ];
+    let result = pool_fixture.pool.submit(&sam, &sam, &sam, &requests);
+    assert_eq!(
+        fixture.env.auths()[0],
+        (
+            sam.clone(),
+            AuthorizedInvocation {
+                function: AuthorizedFunction::Contract((
+                    pool_fixture.pool.address.clone(),
+                    Symbol::new(&fixture.env, "submit"),
+                    vec![
+                        &fixture.env,
+                        sam.to_val(),
+                        sam.to_val(),
+                        sam.to_val(),
+                        requests.to_val()
+                    ]
+                )),
+                sub_invocations: std::vec![]
+            }
+        )
+    );
+    let events = fixture.env.events().all();
+    let event = vec![&fixture.env, events.get_unchecked(events.len() - 2)];
+    let reserve_data = fixture.read_reserve_data(0, TokenIndex::WETH);
+    pool_weth_balance -= amount;
+    sam_weth_balance += amount;
+    assert_eq!(weth.balance(&sam), sam_weth_balance);
+    assert_eq!(weth.balance(&pool_fixture.pool.address), pool_weth_balance);
+    let pool_tokens = amount
+        .fixed_div_ceil(reserve_data.b_rate, SCALAR_12)
+        .unwrap();
+    sam_weth_btoken_balance -= pool_tokens;
+    assert_approx_eq_abs(
+        result.supply.get_unchecked(weth_pool_index),
+        sam_weth_btoken_balance,
+        10,
+    );
+    assert_ne!(sam_weth_btoken_balance, 0); // some interest was earned
+    let event_data: soroban_sdk::Vec<Val> = vec![
+        &fixture.env,
+        amount.into_val(&fixture.env),
+        pool_tokens.into_val(&fixture.env),
+    ];
+    assert_eq!(
+        event,
+        vec![
+            &fixture.env,
+            (
+                pool_fixture.pool.address.clone(),
+                (
+                    Symbol::new(&fixture.env, "withdraw"),
+                    weth.address.clone(),
+                    sam.clone(),
+                )
+                    .into_val(&fixture.env),
+                event_data.into_val(&fixture.env),
+            )
+        ]
+    );
+
+    // Sam supply collateral XLM
+    let amount = 5_000 * SCALAR_7;
+    let requests = vec![
+        &fixture.env,
+        Request {
+            request_type: RequestType::SupplyCollateral as u32,
+            address: xlm.address.clone(),
+            amount,
+        },
+    ];
+    let result = pool_fixture.pool.submit(&sam, &sam, &sam, &requests);
+    assert_eq!(
+        fixture.env.auths()[0],
+        (
+            sam.clone(),
+            AuthorizedInvocation {
+                function: AuthorizedFunction::Contract((
+                    pool_fixture.pool.address.clone(),
+                    Symbol::new(&fixture.env, "submit"),
+                    vec![
+                        &fixture.env,
+                        sam.to_val(),
+                        sam.to_val(),
+                        sam.to_val(),
+                        requests.to_val()
+                    ]
+                )),
+                sub_invocations: std::vec![AuthorizedInvocation {
+                    function: AuthorizedFunction::Contract((
+                        xlm.address.clone(),
+                        Symbol::new(&fixture.env, "transfer"),
+                        vec![
+                            &fixture.env,
+                            sam.to_val(),
+                            pool_fixture.pool.address.to_val(),
+                            amount.into_val(&fixture.env)
+                        ]
+                    )),
+                    sub_invocations: std::vec![]
+                }]
+            }
+        )
+    );
+    let events = fixture.env.events().all();
+    let event = vec![&fixture.env, events.get_unchecked(events.len() - 2)];
+    let reserve_data = fixture.read_reserve_data(0, TokenIndex::XLM);
+    pool_xlm_balance += amount;
+    sam_xlm_balance -= amount;
+    assert_eq!(xlm.balance(&sam), sam_xlm_balance);
+    assert_eq!(xlm.balance(&pool_fixture.pool.address), pool_xlm_balance);
+    sam_xlm_btoken_balance += amount
+        .fixed_div_floor(reserve_data.b_rate, SCALAR_12)
+        .unwrap();
+    assert_approx_eq_abs(
+        result.collateral.get_unchecked(xlm_pool_index),
+        sam_xlm_btoken_balance,
+        10,
+    );
+    let event_data: soroban_sdk::Vec<Val> = vec![
+        &fixture.env,
+        amount.into_val(&fixture.env),
+        result
+            .collateral
+            .get_unchecked(xlm_pool_index)
+            .into_val(&fixture.env),
+    ];
+    assert_eq!(
+        event,
+        vec![
+            &fixture.env,
+            (
+                pool_fixture.pool.address.clone(),
+                (
+                    Symbol::new(&fixture.env, "supply_collateral"),
+                    xlm.address.clone(),
+                    sam.clone()
+                )
+                    .into_val(&fixture.env),
+                event_data.into_val(&fixture.env)
+            )
+        ]
+    );
+
+    // Sam borrows WETH
+    let amount = 1 * (weth_scalar / 10); // 0.1
+    let requests = vec![
+        &fixture.env,
+        Request {
+            request_type: RequestType::Borrow as u32,
+            address: weth.address.clone(),
+            amount,
+        },
+    ];
+    let result = pool_fixture.pool.submit(&sam, &sam, &sam, &requests);
+    assert_eq!(
+        fixture.env.auths()[0],
+        (
+            sam.clone(),
+            AuthorizedInvocation {
+                function: AuthorizedFunction::Contract((
+                    pool_fixture.pool.address.clone(),
+                    Symbol::new(&fixture.env, "submit"),
+                    vec![
+                        &fixture.env,
+                        sam.to_val(),
+                        sam.to_val(),
+                        sam.to_val(),
+                        requests.to_val()
+                    ]
+                )),
+                sub_invocations: std::vec![]
+            }
+        )
+    );
+    let events = fixture.env.events().all();
+    let event = vec![&fixture.env, events.get_unchecked(events.len() - 2)];
+    let reserve_data = fixture.read_reserve_data(0, TokenIndex::WETH);
+    pool_weth_balance -= amount;
+    sam_weth_balance += amount;
+    assert_eq!(weth.balance(&sam), sam_weth_balance);
+    assert_eq!(weth.balance(&pool_fixture.pool.address), pool_weth_balance);
+    sam_weth_dtoken_balance += amount
+        .fixed_div_ceil(reserve_data.d_rate, SCALAR_12)
+        .unwrap();
+    assert_eq!(
+        result.liabilities.get_unchecked(weth_pool_index),
+        sam_weth_dtoken_balance
+    );
+    assert_approx_eq_abs(
+        result.liabilities.get_unchecked(weth_pool_index),
+        sam_weth_dtoken_balance,
+        10,
+    );
+    let event_data: soroban_sdk::Vec<Val> = vec![
+        &fixture.env,
+        amount.into_val(&fixture.env),
+        result
+            .liabilities
+            .get_unchecked(weth_pool_index)
+            .into_val(&fixture.env),
+    ];
+    assert_eq!(
+        event,
+        vec![
+            &fixture.env,
+            (
+                pool_fixture.pool.address.clone(),
+                (
+                    Symbol::new(&fixture.env, "borrow"),
+                    weth.address.clone(),
+                    sam.clone()
+                )
+                    .into_val(&fixture.env),
+                event_data.into_val(&fixture.env)
+            )
+        ]
+    );
+
+    // Accrue six days of interest before repay and withdrawal.
+    fixture.jump(6 * 24 * 60 * 60);
+
+    // Sam repay and withdrawal positions
+    // Request more than the accrued position, exercising complete withdrawal.
+    let amount_withdrawal = pool_fixture
+        .pool
+        .get_reserve(&xlm.address)
+        .to_asset_from_b_token(&fixture.env, sam_xlm_btoken_balance)
+        + 1;
+    let amount_repay = 11 * (weth_scalar / 100); // 0.11
+    let requests = vec![
+        &fixture.env,
+        Request {
+            request_type: RequestType::WithdrawCollateral as u32,
+            address: xlm.address.clone(),
+            amount: amount_withdrawal,
+        },
+        Request {
+            request_type: RequestType::Repay as u32,
+            address: weth.address.clone(),
+            amount: amount_repay,
+        },
+    ];
+    let result = pool_fixture.pool.submit(&sam, &sam, &sam, &requests);
+    assert_eq!(
+        fixture.env.auths()[0],
+        (
+            sam.clone(),
+            AuthorizedInvocation {
+                function: AuthorizedFunction::Contract((
+                    pool_fixture.pool.address.clone(),
+                    Symbol::new(&fixture.env, "submit"),
+                    vec![
+                        &fixture.env,
+                        sam.to_val(),
+                        sam.to_val(),
+                        sam.to_val(),
+                        requests.to_val()
+                    ]
+                )),
+                sub_invocations: std::vec![AuthorizedInvocation {
+                    function: AuthorizedFunction::Contract((
+                        weth.address.clone(),
+                        Symbol::new(&fixture.env, "transfer"),
+                        vec![
+                            &fixture.env,
+                            sam.to_val(),
+                            pool_fixture.pool.address.to_val(),
+                            amount_repay.into_val(&fixture.env)
+                        ]
+                    )),
+                    sub_invocations: std::vec![]
+                }]
+            }
+        )
+    );
+    let events = fixture.env.events().all();
+    // @dev: three transfer events follow the pool events, 1 pool event follows
+    let event = vec![&fixture.env, events.get_unchecked(events.len() - 5)];
+    let xlm_reserve_data = fixture.read_reserve_data(0, TokenIndex::XLM);
+    let est_xlm = sam_xlm_btoken_balance
+        .fixed_mul_floor(xlm_reserve_data.b_rate, SCALAR_12)
+        .unwrap();
+    pool_xlm_balance -= est_xlm;
+    sam_xlm_balance += est_xlm;
+    assert_approx_eq_abs(xlm.balance(&sam), sam_xlm_balance, 10);
+    assert_approx_eq_abs(
+        xlm.balance(&pool_fixture.pool.address),
+        pool_xlm_balance,
+        10,
+    );
+    assert_eq!(result.collateral.len(), 0);
+    let event_data: soroban_sdk::Vec<Val> = vec![
+        &fixture.env,
+        est_xlm.into_val(&fixture.env),
+        sam_xlm_btoken_balance.into_val(&fixture.env),
+    ];
+    assert_eq!(
+        event,
+        vec![
+            &fixture.env,
+            (
+                pool_fixture.pool.address.clone(),
+                (
+                    Symbol::new(&fixture.env, "withdraw_collateral"),
+                    xlm.address.clone(),
+                    sam.clone()
+                )
+                    .into_val(&fixture.env),
+                event_data.into_val(&fixture.env)
+            )
+        ]
+    );
+    let weth_reserve_data = fixture.read_reserve_data(0, TokenIndex::WETH);
+    let est_weth = sam_weth_dtoken_balance
+        .fixed_mul_ceil(weth_reserve_data.d_rate, SCALAR_12)
+        .unwrap();
+    pool_weth_balance += est_weth;
+    sam_weth_balance -= est_weth;
+    assert_eq!(weth.balance(&sam), sam_weth_balance);
+    assert_approx_eq_abs(weth.balance(&sam), sam_weth_balance, 10);
+    assert_approx_eq_abs(
+        weth.balance(&pool_fixture.pool.address),
+        pool_weth_balance,
+        10,
+    );
+    assert_eq!(result.liabilities.len(), 0);
+    // @dev: three transfer events follow the pool events
+    let event = vec![&fixture.env, events.get_unchecked(events.len() - 4)];
+    let event_data: soroban_sdk::Vec<Val> = vec![
+        &fixture.env,
+        est_weth.into_val(&fixture.env),
+        sam_weth_dtoken_balance.into_val(&fixture.env),
+    ];
+    assert_eq!(
+        event,
+        vec![
+            &fixture.env,
+            (
+                pool_fixture.pool.address.clone(),
+                (
+                    Symbol::new(&fixture.env, "repay"),
+                    weth.address.clone(),
+                    sam.clone()
+                )
+                    .into_val(&fixture.env),
+                event_data.into_val(&fixture.env)
+            )
+        ]
+    );
+}
+
+/// Test user exposed functions on the lending pool for basic configuration functionality, auth, and events.
+/// Does not test internal state management of the lending pool, only external effects.
+#[test]
+fn test_pool_config() {
+    let fixture = create_fixture_with_data(false);
+
+    let pool_fixture = &fixture.pools[0];
+
+    // Disable an existing reserve through the sealed, timelocked configuration path.
+    let blnd = &fixture.tokens[TokenIndex::WETH];
+    let mut reserve_config = fixture.read_reserve_config(0, TokenIndex::WETH);
+    let original_config = reserve_config.clone();
+    reserve_config.enabled = false;
+    pool_fixture
+        .pool
+        .queue_set_reserve(&blnd.address, &reserve_config);
+    assert_eq!(
+        fixture.env.auths()[0],
+        (
+            fixture.bombadil.clone(),
+            AuthorizedInvocation {
+                function: AuthorizedFunction::Contract((
+                    pool_fixture.pool.address.clone(),
+                    Symbol::new(&fixture.env, "queue_set_reserve"),
+                    vec![
+                        &fixture.env,
+                        blnd.address.to_val(),
+                        reserve_config.into_val(&fixture.env)
+                    ]
+                )),
+                sub_invocations: std::vec![]
+            }
+        )
+    );
+
+    fixture.jump(604800); // 1 week
+
+    pool_fixture.pool.set_reserve(&blnd.address);
+    let event = vec![&fixture.env, fixture.env.events().all().last_unchecked()];
+    let event_data: soroban_sdk::Vec<Val> = vec![
+        &fixture.env,
+        blnd.address.into_val(&fixture.env),
+        reserve_config.index.into_val(&fixture.env),
+    ];
+    assert_eq!(
+        event,
+        vec![
+            &fixture.env,
+            (
+                pool_fixture.pool.address.clone(),
+                (Symbol::new(&fixture.env, "set_reserve"),).into_val(&fixture.env),
+                event_data.into_val(&fixture.env)
+            )
+        ]
+    );
+    let new_reserve_config = fixture.read_reserve_config(0, TokenIndex::WETH);
+    assert_eq!(new_reserve_config.enabled, reserve_config.enabled);
+    assert!(!new_reserve_config.enabled);
+    assert_eq!(new_reserve_config.index, original_config.index);
+    assert_eq!(new_reserve_config.c_factor, original_config.c_factor);
+    assert_eq!(new_reserve_config.l_factor, original_config.l_factor);
+    assert_eq!(new_reserve_config.util, original_config.util);
+    assert_eq!(new_reserve_config.max_util, original_config.max_util);
+    assert_eq!(new_reserve_config.r_base, original_config.r_base);
+    assert_eq!(new_reserve_config.r_one, original_config.r_one);
+    assert_eq!(new_reserve_config.r_two, original_config.r_two);
+    assert_eq!(new_reserve_config.r_three, original_config.r_three);
+    assert_eq!(new_reserve_config.reactivity, original_config.reactivity);
+    assert_eq!(new_reserve_config.supply_cap, original_config.supply_cap);
+
+    // Set admin (admin only)
+
+    // step 1 - propose new admin
+    let new_admin = Address::generate(&fixture.env);
+    pool_fixture.pool.propose_admin(&new_admin);
+    assert_eq!(
+        fixture.env.auths()[0],
+        (
+            fixture.bombadil.clone(),
+            AuthorizedInvocation {
+                function: AuthorizedFunction::Contract((
+                    pool_fixture.pool.address.clone(),
+                    Symbol::new(&fixture.env, "propose_admin"),
+                    vec![&fixture.env, new_admin.to_val(),]
+                )),
+                sub_invocations: std::vec![]
+            }
+        )
+    );
+    assert_eq!(fixture.bombadil, pool_fixture.pool.get_admin());
+
+    fixture.jump_with_sequence(100);
+
+    // step 2 - accept new admin
+    pool_fixture.pool.accept_admin();
+    assert_eq!(
+        fixture.env.auths()[0],
+        (
+            new_admin.clone(),
+            AuthorizedInvocation {
+                function: AuthorizedFunction::Contract((
+                    pool_fixture.pool.address.clone(),
+                    Symbol::new(&fixture.env, "accept_admin"),
+                    vec![&fixture.env]
+                )),
+                sub_invocations: std::vec![]
+            }
+        )
+    );
+    let event = vec![&fixture.env, fixture.env.events().all().last_unchecked()];
+    assert_eq!(
+        event,
+        vec![
+            &fixture.env,
+            (
+                pool_fixture.pool.address.clone(),
+                (
+                    Symbol::new(&fixture.env, "set_admin"),
+                    fixture.bombadil.clone()
+                )
+                    .into_val(&fixture.env),
+                new_admin.into_val(&fixture.env)
+            )
+        ]
+    );
+    assert_eq!(new_admin, pool_fixture.pool.get_admin());
+
+    // Set status (admin only)
+    pool_fixture.pool.set_status(&2);
+    assert_eq!(
+        fixture.env.auths()[0],
+        (
+            new_admin.clone(),
+            AuthorizedInvocation {
+                function: AuthorizedFunction::Contract((
+                    pool_fixture.pool.address.clone(),
+                    Symbol::new(&fixture.env, "set_status"),
+                    vec![&fixture.env, 2u32.into_val(&fixture.env)]
+                )),
+                sub_invocations: std::vec![]
+            }
+        )
+    );
+    let event = vec![&fixture.env, fixture.env.events().all().last_unchecked()];
+    assert_eq!(
+        event,
+        vec![
+            &fixture.env,
+            (
+                pool_fixture.pool.address.clone(),
+                (Symbol::new(&fixture.env, "set_status"), new_admin.clone()).into_val(&fixture.env),
+                2u32.into_val(&fixture.env)
+            )
+        ]
+    );
+    let new_pool_config = fixture.read_pool_config(0);
+    assert_eq!(new_pool_config.status, 2);
+
+    //revert to standard status (admin only)
+    pool_fixture.pool.set_status(&0);
+    assert_eq!(
+        fixture.env.auths()[0],
+        (
+            new_admin.clone(),
+            AuthorizedInvocation {
+                function: AuthorizedFunction::Contract((
+                    pool_fixture.pool.address.clone(),
+                    Symbol::new(&fixture.env, "set_status"),
+                    vec![&fixture.env, 0u32.into_val(&fixture.env)]
+                )),
+                sub_invocations: std::vec![]
+            }
+        )
+    );
+    let event = vec![&fixture.env, fixture.env.events().all().last_unchecked()];
+    assert_eq!(
+        event,
+        vec![
+            &fixture.env,
+            (
+                pool_fixture.pool.address.clone(),
+                (Symbol::new(&fixture.env, "set_status"), new_admin.clone()).into_val(&fixture.env),
+                0u32.into_val(&fixture.env)
+            )
+        ]
+    );
+    let new_pool_config = fixture.read_pool_config(0);
+    assert_eq!(new_pool_config.status, 0);
+
+    // Queue 50% of backstop for withdrawal
+    fixture.backstop.queue_withdrawal(
+        &fixture.users[0],
+        &pool_fixture.pool.address,
+        &(25_000 * SCALAR_7),
+    );
+
+    // Update status (backstop is unhealthy, so this should update to backstop on-ice)
+    pool_fixture.pool.update_status();
+    assert_eq!(fixture.env.auths().len(), 0);
+    let event = vec![&fixture.env, fixture.env.events().all().last_unchecked()];
+    assert_eq!(
+        event,
+        vec![
+            &fixture.env,
+            (
+                pool_fixture.pool.address.clone(),
+                (Symbol::new(&fixture.env, "set_status"),).into_val(&fixture.env),
+                3u32.into_val(&fixture.env)
+            )
+        ]
+    );
+    let new_pool_config = fixture.read_pool_config(0);
+    assert_eq!(new_pool_config.status, 3);
+
+    // Dequeue 50% of backstop for withdrawal
+    fixture.backstop.dequeue_withdrawal(
+        &fixture.users[0],
+        &pool_fixture.pool.address,
+        &(25_000 * SCALAR_7),
+    );
+
+    // Update status (backstop is healthy, so this should update to active)
+    pool_fixture.pool.update_status();
+    assert_eq!(fixture.env.auths().len(), 0);
+    let event = vec![&fixture.env, fixture.env.events().all().last_unchecked()];
+    assert_eq!(
+        event,
+        vec![
+            &fixture.env,
+            (
+                pool_fixture.pool.address.clone(),
+                (Symbol::new(&fixture.env, "set_status"),).into_val(&fixture.env),
+                1u32.into_val(&fixture.env)
+            )
+        ]
+    );
+    let new_pool_config = fixture.read_pool_config(0);
+    assert_eq!(new_pool_config.status, 1);
+
+    // Set emissions config is trapped by the fork: no admin route to b-token emissions state.
+    let reserve_emissions: soroban_sdk::Vec<ReserveEmissionMetadata> = soroban_sdk::vec![
+        &fixture.env,
+        ReserveEmissionMetadata {
+            res_index: 0, // STABLE
+            res_type: 0,  // d_token
+            share: 0_400_0000
+        },
+        ReserveEmissionMetadata {
+            res_index: 1, // XLM
+            res_type: 1,  // b_token
+            share: 0_400_0000
+        },
+        ReserveEmissionMetadata {
+            res_index: 2, // WETH
+            res_type: 1,  // b_token
+            share: 0_200_0000
+        },
+    ];
+    let before = fixture.env.to_ledger_snapshot();
+    assert_eq!(
+        pool_fixture
+            .pool
+            .try_set_emissions_config(&reserve_emissions)
+            .err(),
+        Some(Ok(Error::from_contract_error(1200)))
+    );
+    assert_eq!(fixture.env.to_ledger_snapshot(), before);
+}
+
+#[test]
+fn test_accept_admin_rejects_expired_proposal() {
+    let fixture = create_fixture_with_data(false);
+    let pool_fixture = &fixture.pools[0];
+    let new_admin = Address::generate(&fixture.env);
+    pool_fixture.pool.propose_admin(&new_admin);
+
+    // The proposal is valid 10 days (10 * 17280 = 172800 ledgers) past the
+    // ledger it was made on. Accepting it within the window still works.
+    fixture.jump_with_sequence(9 * 24 * 60 * 60);
+    pool_fixture.pool.accept_admin();
+
+    // Propose again, then step one ledger past the 10-day expiry. The
+    // 10-day deadline is enforced by the expiry stored with the proposal,
+    // since a temporary entry's TTL can be extended by anyone.
+    let new_admin = Address::generate(&fixture.env);
+    pool_fixture.pool.propose_admin(&new_admin);
+    fixture.jump_with_sequence(10 * 24 * 60 * 60 + 5);
+    assert_eq!(
+        pool_fixture.pool.try_accept_admin().err(),
+        Some(Ok(Error::from_contract_error(1200))),
+        "expired proposals must be rejected"
+    );
+}
+
+#[test]
+fn setup_cannot_plant_an_immediate_reserve_disable() {
+    for wasm in [false, true] {
+        let mut fixture = TestFixture::create(wasm);
+        fixture.create_pool(String::from_str(&fixture.env, "Teapot"), 0, 6, 1_0000000);
+        let mut config = default_reserve_metadata();
+        config.decimals = 6;
+        fixture.create_pool_reserve(0, TokenIndex::STABLE, &config);
+
+        let pool = &fixture.pools[0].pool;
+        let asset = &fixture.tokens[TokenIndex::STABLE].address;
+        config.enabled = false;
+        assert_eq!(
+            pool.try_queue_set_reserve(asset, &config).err(),
+            Some(Ok(Error::from_contract_error(1202))),
+            "wasm={wasm}"
+        );
+        assert_eq!(
+            pool.try_set_reserve(asset).err(),
+            Some(Ok(Error::from_type_and_code(
+                ScErrorType::Context,
+                ScErrorCode::InvalidAction
+            ))),
+            "wasm={wasm}"
+        );
+    }
+}
+
+/// Re-point a pool at a fresh SEP-40 oracle that supports its reserves at a valid 7
+/// decimals but has never published a price, so `lastprice` returns `None` for every
+/// supported asset.
+fn repoint_at_priceless_oracle(fixture: &TestFixture<'_>, pool_index: usize) {
+    let (oracle, oracle_client) = create_mock_oracle(&fixture.env);
+    oracle_client.set_data(
+        &fixture.bombadil,
+        &Asset::Other(Symbol::new(&fixture.env, "USD")),
+        &vec![
+            &fixture.env,
+            Asset::Stellar(fixture.tokens[TokenIndex::STABLE].address.clone()),
+            Asset::Stellar(fixture.tokens[TokenIndex::XLM].address.clone()),
+            Asset::Stellar(fixture.tokens[TokenIndex::WETH].address.clone()),
+        ],
+        &7,
+        &300,
+    );
+
+    let mut config = fixture.read_pool_config(pool_index);
+    config.oracle = oracle;
+    let pool_address = fixture.pools[pool_index].pool.address.clone();
+    fixture.env.as_contract(&pool_address, || {
+        fixture
+            .env
+            .storage()
+            .instance()
+            .set(&Symbol::new(&fixture.env, "Config"), &config);
+    });
+}
+
+/// A rolled-back call can leave failed-call diagnostic copies of the events it emitted,
+/// but it must never commit one.
+fn assert_no_committed_events(fixture: &TestFixture<'_>, pre_len: usize, context: &str) {
+    let events = fixture.env.to_snapshot().events;
+    assert!(
+        events.0[pre_len..].iter().all(|event| {
+            event.failed_call || event.event.type_ != soroban_sdk::xdr::ContractEventType::Contract
+        }),
+        "{context}"
+    );
+}
+
+/// The pool's existing #1210 InvalidPrice path must cover a health-dependent `submit`
+/// whose feed has no latest price, instead of the response unwrap trapping in the host.
+#[test]
+fn submit_fails_with_invalid_price_when_a_supported_asset_has_no_latest_price() {
+    for wasm in [false, true] {
+        let fixture = create_fixture_with_data(wasm);
+        let pool_fixture = &fixture.pools[0];
+        let frodo = &fixture.users[0];
+        let stable = &fixture.tokens[TokenIndex::STABLE];
+        // Supply and borrow the same asset with a negative net: a successful submit
+        // pulls exactly the difference from the spender allowance via transfer_from.
+        let supply = 10 * 10i128.pow(6);
+        let borrow = 10i128.pow(6);
+        let net = supply - borrow;
+        let requests = vec![
+            &fixture.env,
+            Request {
+                request_type: RequestType::Supply as u32,
+                address: stable.address.clone(),
+                amount: supply,
+            },
+            Request {
+                request_type: RequestType::Borrow as u32,
+                address: stable.address.clone(),
+                amount: borrow,
+            },
+        ];
+
+        // Control: while the feed is priced, this exact request set clears auth, status,
+        // position and utilization gates and commits.
+        stable.approve(
+            frodo,
+            &pool_fixture.pool.address,
+            &net,
+            &fixture.env.ledger().sequence(),
+        );
+        pool_fixture
+            .pool
+            .submit_with_allowance(frodo, frodo, frodo, &requests);
+        assert_eq!(
+            stable.allowance(frodo, &pool_fixture.pool.address),
+            0,
+            "wasm={wasm}: control did not consume the allowance"
+        );
+
+        repoint_at_priceless_oracle(&fixture, 0);
+        stable.approve(
+            frodo,
+            &pool_fixture.pool.address,
+            &net,
+            &fixture.env.ledger().sequence(),
+        );
+
+        let before = fixture.env.to_ledger_snapshot();
+        let pre_events = fixture.env.to_snapshot().events.0.len();
+        assert_eq!(
+            pool_fixture
+                .pool
+                .try_submit_with_allowance(frodo, frodo, frodo, &requests)
+                .err(),
+            Some(Ok(Error::from_contract_error(1210))),
+            "wasm={wasm}"
+        );
+        assert_eq!(
+            fixture.env.to_ledger_snapshot(),
+            before,
+            "wasm={wasm}: missing price rejection changed ledger, TTL, token or allowance state"
+        );
+        assert_no_committed_events(
+            &fixture,
+            pre_events,
+            "missing price submit committed events",
+        );
+        assert_eq!(
+            stable.allowance(frodo, &pool_fixture.pool.address),
+            net,
+            "wasm={wasm}: rejected submit spent the spender allowance"
+        );
+    }
+}
+
+/// A type-0 liquidation auction must reach the pool's existing #1210 InvalidPrice path
+/// when the feed has no latest price. The identical auction is rejected #1211 while the
+/// feed is priced, so the #1210 assertion cannot be an auction-shape rejection.
+#[test]
+fn new_user_liquidation_auction_fails_with_invalid_price_without_a_latest_price() {
+    for wasm in [false, true] {
+        let fixture = create_fixture_with_data(wasm);
+        let pool_fixture = &fixture.pools[0];
+        let user = &fixture.users[0];
+        let bid = vec![
+            &fixture.env,
+            fixture.tokens[TokenIndex::STABLE].address.clone(),
+        ];
+        let lot = vec![
+            &fixture.env,
+            fixture.tokens[TokenIndex::WETH].address.clone(),
+        ];
+
+        assert_eq!(
+            pool_fixture
+                .pool
+                .try_new_auction(&0, user, &bid, &lot, &45)
+                .err(),
+            Some(Ok(Error::from_contract_error(1211))),
+            "wasm={wasm}"
+        );
+
+        repoint_at_priceless_oracle(&fixture, 0);
+
+        let before = fixture.env.to_ledger_snapshot();
+        let pre_events = fixture.env.to_snapshot().events.0.len();
+        assert_eq!(
+            pool_fixture
+                .pool
+                .try_new_auction(&0, user, &bid, &lot, &45)
+                .err(),
+            Some(Ok(Error::from_contract_error(1210))),
+            "wasm={wasm}"
+        );
+        assert_eq!(
+            fixture.env.to_ledger_snapshot(),
+            before,
+            "wasm={wasm}: missing price auction creation changed ledger or TTL"
+        );
+        assert_no_committed_events(
+            &fixture,
+            pre_events,
+            "missing price auction creation committed events",
+        );
+    }
+}
+
+#[test]
+fn missing_price_rolls_back_user_liquidation_auction_deletion() {
+    for wasm in [false, true] {
+        let fixture = create_fixture_with_data(wasm);
+        let pool = &fixture.pools[0].pool;
+        let borrower = Address::generate(&fixture.env);
+        let stable = &fixture.tokens[TokenIndex::STABLE];
+        let xlm = &fixture.tokens[TokenIndex::XLM];
+        stable.mint(&borrower, &(1000 * 10i128.pow(6)));
+        pool.submit(
+            &borrower,
+            &borrower,
+            &borrower,
+            &vec![
+                &fixture.env,
+                Request {
+                    request_type: RequestType::SupplyCollateral as u32,
+                    address: stable.address.clone(),
+                    amount: 1000 * 10i128.pow(6),
+                },
+                Request {
+                    request_type: RequestType::Borrow as u32,
+                    address: xlm.address.clone(),
+                    amount: 6075 * SCALAR_7,
+                },
+            ],
+        );
+        fixture.oracle.set_price_stable(&vec![
+            &fixture.env,
+            2000_0000000,
+            1_0000000,
+            0_1200000,
+            1_0000000,
+        ]);
+        pool.new_auction(
+            &0,
+            &borrower,
+            &vec![&fixture.env, xlm.address.clone()],
+            &vec![&fixture.env, stable.address.clone()],
+            &50,
+        );
+        assert!(pool.try_get_auction(&0, &borrower).is_ok(), "wasm={wasm}");
+        repoint_at_priceless_oracle(&fixture, 0);
+
+        // Deletion and its event precede the health check that needs the missing price.
+        let requests = vec![
+            &fixture.env,
+            Request {
+                request_type: RequestType::DeleteLiquidationAuction as u32,
+                address: borrower.clone(),
+                amount: 0,
+            },
+        ];
+        let before = fixture.env.to_ledger_snapshot();
+        let pre_events = fixture.env.to_snapshot().events.0.len();
+        assert_eq!(
+            pool.try_submit(&borrower, &borrower, &borrower, &requests)
+                .err(),
+            Some(Ok(Error::from_contract_error(1210))),
+            "wasm={wasm}"
+        );
+        assert_eq!(
+            fixture.env.to_ledger_snapshot(),
+            before,
+            "wasm={wasm}: missing price auction deletion changed ledger or TTL"
+        );
+        assert_no_committed_events(
+            &fixture,
+            pre_events,
+            &format!("wasm={wasm}: missing price auction deletion committed events"),
+        );
+        assert!(
+            pool.try_get_auction(&0, &borrower).is_ok(),
+            "wasm={wasm}: rejected submit deleted the liquidation auction"
+        );
+    }
+}

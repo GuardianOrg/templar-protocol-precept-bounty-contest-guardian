@@ -1,5 +1,6 @@
-use soroban_sdk::{map, panic_with_error, unwrap::UnwrapOptimized, vec, Address, Env, Map, Vec};
+use soroban_sdk::{map, panic_with_error, vec, Address, Env, Map, Vec};
 
+#[cfg(not(feature = "certora"))]
 use sep_40_oracle::{Asset, PriceFeedClient};
 
 use crate::{
@@ -73,10 +74,7 @@ impl Pool {
     /// ### Arguments
     /// * `action_type` - The type of action being performed
     pub fn require_action_allowed(&self, e: &Env, action_type: u32) {
-        // disable borrowing or auction cancellation for any non-active pool and disable supplying for any frozen pool
-        if (self.config.status > 1 && (action_type == 4 || action_type == 9))
-            || (self.config.status > 3 && (action_type == 2 || action_type == 0))
-        {
+        if is_action_disallowed(self.config.status, action_type) {
             panic_with_error!(e, PoolError::InvalidPoolStatus);
         }
     }
@@ -103,8 +101,13 @@ impl Pool {
         if let Some(decimals) = self.price_decimals {
             return decimals;
         }
-        let oracle_client = PriceFeedClient::new(e, &self.config.oracle);
-        let decimals = oracle_client.decimals();
+        #[cfg(not(feature = "certora"))]
+        let decimals = PriceFeedClient::new(e, &self.config.oracle).decimals();
+        #[cfg(feature = "certora")]
+        let decimals = crate::spec::oracle::decimals_summary();
+        if decimals != 7 {
+            panic_with_error!(e, PoolError::InvalidPrice);
+        }
         self.price_decimals = Some(decimals);
         decimals
     }
@@ -115,21 +118,44 @@ impl Pool {
     /// * asset - The address of the underlying asset
     ///
     /// ### Panics
-    /// If the price is invalid due to being over a day old or being less than or equal to 0
+    /// If no latest price is available, or the price is future-dated, over a day old,
+    /// or less than or equal to 0.
     pub fn load_price(&mut self, e: &Env, asset: &Address) -> i128 {
         if let Some(price) = self.prices.get(asset.clone()) {
             return price;
         }
-        let oracle_client = PriceFeedClient::new(e, &self.config.oracle);
-        let oracle_asset = Asset::Stellar(asset.clone());
-        let price_data = oracle_client.lastprice(&oracle_asset).unwrap_optimized();
-        if price_data.timestamp + 24 * 60 * 60 < e.ledger().timestamp() || price_data.price <= 0 {
+        #[cfg(not(feature = "certora"))]
+        let reported =
+            PriceFeedClient::new(e, &self.config.oracle).lastprice(&Asset::Stellar(asset.clone()));
+        #[cfg(feature = "certora")]
+        let reported = crate::spec::oracle::lastprice_summary();
+
+        let price_data = reported.unwrap_or_else(|| panic_with_error!(e, PoolError::InvalidPrice));
+        let now = e.ledger().timestamp();
+        if price_data.timestamp > now
+            || now - price_data.timestamp > 86_400
+            || price_data.price <= 0
+        {
             panic_with_error!(e, PoolError::InvalidPrice);
         }
         self.prices.set(asset.clone(), price_data.price);
         price_data.price
     }
 }
+
+/// Whether `action_type` is disallowed by the pool status gate:
+/// - borrow (4) and cancel auction (9) are disallowed for any non-active pool (status > 1)
+/// - supply (0) and supply collateral (2) are additionally disallowed once the pool is frozen (status > 3)
+///
+/// Any other action id, including ids outside RequestType, passes this gate.
+fn is_action_disallowed(status: u32, action_type: u32) -> bool {
+    (status > 1 && (action_type == 4 || action_type == 9))
+        || (status > 3 && (action_type == 2 || action_type == 0))
+}
+
+#[cfg(kani)]
+#[path = "../proofs/pool.rs"]
+mod verification;
 
 #[cfg(test)]
 mod tests {
@@ -290,6 +316,63 @@ mod tests {
             assert_eq!(new_reserve_data.d_rate, 123);
             let new_reserve_data = storage::get_res_data(&e, &reserve_2.asset);
             assert_eq!(new_reserve_data.d_rate, 456);
+        });
+    }
+
+    #[test]
+    fn test_reserve_cache_does_nothing_if_nothing_marked() {
+        let e = Env::default();
+        e.mock_all_auths();
+
+        e.ledger().set(LedgerInfo {
+            timestamp: 123456 * 5,
+            protocol_version: 22,
+            sequence_number: 123456,
+            network_id: Default::default(),
+            base_reserve: 10,
+            min_temp_entry_ttl: 10,
+            min_persistent_entry_ttl: 10,
+            max_entry_ttl: 3110400,
+        });
+
+        let bombadil = Address::generate(&e);
+        let pool = testutils::create_pool(&e);
+        let oracle = Address::generate(&e);
+
+        let (underlying_0, _) = testutils::create_token_contract(&e, &bombadil);
+        let (mut reserve_config, reserve_data_0) = testutils::default_reserve_meta();
+        testutils::create_reserve(&e, &pool, &underlying_0, &reserve_config, &reserve_data_0);
+
+        let (underlying_1, _) = testutils::create_token_contract(&e, &bombadil);
+        let mut reserve_data_1 = reserve_data_0.clone();
+        reserve_config.index = 1;
+        reserve_data_1.d_rate = 1_001_000_000_000;
+        testutils::create_reserve(&e, &pool, &underlying_1, &reserve_config, &reserve_data_1);
+
+        let pool_config = PoolConfig {
+            oracle,
+            min_collateral: 1_0000000,
+            bstop_rate: 0_2000000,
+            status: 0,
+            max_positions: 2,
+        };
+        e.as_contract(&pool, || {
+            storage::set_pool_config(&e, &pool_config);
+            let mut pool = Pool::load(&e);
+            let mut reserve_0 = pool.load_reserve(&e, &underlying_0, false);
+            reserve_0.data.d_rate = 0;
+            let mut reserve_1 = pool.load_reserve(&e, &underlying_1, false);
+            reserve_1.data.d_rate = 0;
+
+            pool.cache_reserve(reserve_0.clone());
+            pool.cache_reserve(reserve_1.clone());
+
+            // store all cached reserves and verify the temp one was not stored
+            pool.store_cached_reserves(&e);
+            let new_reserve_data = storage::get_res_data(&e, &underlying_0);
+            assert_eq!(new_reserve_data.d_rate, reserve_data_0.d_rate);
+            let new_reserve_data = storage::get_res_data(&e, &underlying_1);
+            assert_eq!(new_reserve_data.d_rate, reserve_data_1.d_rate);
         });
     }
 
@@ -586,6 +669,42 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "Error(Contract, #1210)")]
+    fn test_load_price_panics_if_no_latest_price() {
+        let e = Env::default();
+        e.mock_all_auths_allowing_non_root_auth();
+
+        let bombadil = Address::generate(&e);
+        let pool = testutils::create_pool(&e);
+        let asset = Address::generate(&e);
+        let (oracle, oracle_client) = testutils::create_mock_oracle(&e);
+
+        // The asset is supported and the feed reports valid 7 decimals, but no price was
+        // ever published, so `lastprice` returns None.
+        oracle_client.set_data(
+            &bombadil,
+            &Asset::Other(Symbol::new(&e, "USD")),
+            &vec![&e, Asset::Stellar(asset.clone())],
+            &7,
+            &300,
+        );
+
+        let pool_config = PoolConfig {
+            oracle,
+            min_collateral: 1_0000000,
+            bstop_rate: 0_2000000,
+            status: 0,
+            max_positions: 2,
+        };
+        e.as_contract(&pool, || {
+            storage::set_pool_config(&e, &pool_config);
+            let mut pool = Pool::load(&e);
+
+            pool.load_price(&e, &asset);
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #1210)")]
     fn test_load_price_panics_if_stale() {
         let e = Env::default();
         e.mock_all_auths_allowing_non_root_auth();
@@ -814,6 +933,125 @@ mod tests {
             user.add_liabilities(&e, &mut reserve_1, 42);
 
             pool.require_under_max(&e, &user.positions, prev_positions);
+        });
+    }
+    #[test]
+    fn test_load_price_accepts_exact_24_hours() {
+        let e = Env::default();
+        e.mock_all_auths_allowing_non_root_auth();
+
+        e.ledger().set(LedgerInfo {
+            timestamp: 1000 + 24 * 60 * 60,
+            protocol_version: 22,
+            sequence_number: 1234,
+            network_id: Default::default(),
+            base_reserve: 10,
+            min_temp_entry_ttl: 10,
+            min_persistent_entry_ttl: 10,
+            max_entry_ttl: 3110400,
+        });
+
+        let bombadil = Address::generate(&e);
+        let pool = testutils::create_pool(&e);
+        let asset = Address::generate(&e);
+        let (oracle, oracle_client) = testutils::create_mock_oracle(&e);
+        oracle_client.set_data(
+            &bombadil,
+            &Asset::Other(Symbol::new(&e, "USD")),
+            &vec![&e, Asset::Stellar(asset.clone())],
+            &7,
+            &300,
+        );
+        oracle_client.set_price(&vec![&e, 123], &1000);
+        let pool_config = PoolConfig {
+            oracle,
+            min_collateral: 1_0000000,
+            bstop_rate: 0_2000000,
+            status: 0,
+            max_positions: 2,
+        };
+        e.as_contract(&pool, || {
+            storage::set_pool_config(&e, &pool_config);
+            let mut pool = Pool::load(&e);
+
+            let price = pool.load_price(&e, &asset);
+            assert_eq!(price, 123);
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #1210)")]
+    fn test_load_price_panics_if_future_dated() {
+        let e = Env::default();
+        e.mock_all_auths_allowing_non_root_auth();
+
+        e.ledger().set(LedgerInfo {
+            timestamp: 1000,
+            protocol_version: 22,
+            sequence_number: 1234,
+            network_id: Default::default(),
+            base_reserve: 10,
+            min_temp_entry_ttl: 10,
+            min_persistent_entry_ttl: 10,
+            max_entry_ttl: 3110400,
+        });
+
+        let bombadil = Address::generate(&e);
+        let pool = testutils::create_pool(&e);
+        let asset = Address::generate(&e);
+        let (oracle, oracle_client) = testutils::create_mock_oracle(&e);
+        oracle_client.set_data(
+            &bombadil,
+            &Asset::Other(Symbol::new(&e, "USD")),
+            &vec![&e, Asset::Stellar(asset.clone())],
+            &7,
+            &300,
+        );
+        oracle_client.set_price(&vec![&e, 123], &(1000 + 1));
+        let pool_config = PoolConfig {
+            oracle,
+            min_collateral: 1_0000000,
+            bstop_rate: 0_2000000,
+            status: 0,
+            max_positions: 2,
+        };
+        e.as_contract(&pool, || {
+            storage::set_pool_config(&e, &pool_config);
+            let mut pool = Pool::load(&e);
+
+            pool.load_price(&e, &asset);
+            assert!(false);
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #1210)")]
+    fn test_load_price_decimals_panics_if_wrong_decimals() {
+        let e = Env::default();
+        e.mock_all_auths();
+
+        let pool = testutils::create_pool(&e);
+        let (oracle, oracle_client) = testutils::create_mock_oracle(&e);
+        oracle_client.set_data(
+            &Address::generate(&e),
+            &Asset::Stellar(Address::generate(&e)),
+            &vec![&e, Asset::Stellar(Address::generate(&e))],
+            &6,
+            &300,
+        );
+        let pool_config = PoolConfig {
+            oracle,
+            min_collateral: 1_0000000,
+            bstop_rate: 0_2000000,
+            status: 0,
+            max_positions: 2,
+        };
+        e.as_contract(&pool, || {
+            storage::set_pool_config(&e, &pool_config);
+            let mut pool = Pool::load(&e);
+
+            pool.load_price_decimals(&e);
+            assert!(false);
         });
     }
 }

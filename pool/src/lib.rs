@@ -7,13 +7,17 @@ extern crate std;
 pub use pool::{Pool as PoolState, PositionData, Reserve};
 
 mod auctions;
+#[path = "../../shared/backstop_threshold.rs"]
+mod backstop_threshold;
 mod constants;
 mod contract;
 mod dependencies;
 mod emissions;
 mod errors;
 mod events;
+mod math;
 mod pool;
+mod spec;
 mod storage;
 mod testutils;
 mod validator;

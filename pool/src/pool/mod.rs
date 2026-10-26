@@ -1,8 +1,8 @@
-mod actions;
+pub(crate) mod actions;
 pub use actions::{FlashLoan, Request, RequestType};
 
 mod bad_debt;
-pub use bad_debt::transfer_bad_debt_to_backstop;
+pub use bad_debt::{bad_debt, check_and_handle_backstop_bad_debt, check_and_handle_user_bad_debt};
 
 mod config;
 pub use config::{
@@ -15,7 +15,7 @@ pub use health_factor::PositionData;
 
 mod interest;
 
-mod submit;
+pub(crate) mod submit;
 
 pub use submit::{execute_submit, execute_submit_with_flash_loan};
 

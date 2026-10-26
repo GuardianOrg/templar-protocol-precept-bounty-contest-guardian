@@ -5,6 +5,7 @@ use soroban_sdk::{contracttype, panic_with_error, Address, Env};
 use crate::{
     constants::{SCALAR_12, SCALAR_7},
     errors::PoolError,
+    math::FixedMath,
     pool::actions::RequestType,
     storage::{self, PoolConfig, ReserveConfig, ReserveData},
 };
@@ -18,6 +19,18 @@ pub struct Reserve {
     pub config: ReserveConfig, // the reserve configuration
     pub data: ReserveData,     // the reserve data
     pub scalar: i128,
+}
+
+#[cfg(feature = "certora")]
+impl cvlr::nondet::Nondet for Reserve {
+    fn nondet() -> Self {
+        Self {
+            asset: cvlr_soroban::nondet_address(),
+            config: cvlr::nondet(),
+            data: cvlr::nondet(),
+            scalar: cvlr::nondet(),
+        }
+    }
 }
 
 impl Reserve {
@@ -68,11 +81,11 @@ impl Reserve {
         );
         reserve.data.ir_mod = new_ir_mod;
 
-        let pre_update_liabilities = reserve.total_liabilities(e);
-        reserve.data.d_rate = loan_accrual.fixed_mul_ceil(e, &reserve.data.d_rate, &SCALAR_12);
-        let accrued_interest = reserve.total_liabilities(e) - pre_update_liabilities;
+        let accrued_interest = reserve.data.grow_debt(e, loan_accrual);
 
-        reserve.gulp(e, pool_config.bstop_rate, accrued_interest);
+        reserve
+            .data
+            .accrue(e, pool_config.bstop_rate, accrued_interest);
 
         reserve.data.last_time = e.ledger().timestamp();
         reserve
@@ -83,39 +96,26 @@ impl Reserve {
         storage::set_res_data(e, &self.asset, &self.data);
     }
 
-    /// Accrue tokens to the reserve supply. This issues any `backstop_credit` required and updates the reserve's bRate to account for the additional tokens.
+    /// Fetch the current utilization rate for the reserve normalized to 7 decimals
     ///
-    /// ### Arguments
-    /// * bstop_rate - The backstop take rate for the pool
-    /// * accrued - The amount of additional underlying tokens
-    pub fn gulp(&mut self, e: &Env, bstop_rate: u32, accrued: i128) {
-        let pre_update_supply = self.total_supply(e);
+    /// This is capped at 100% to ensure interest calculations are fair.
+    pub fn utilization(&self, e: &Env) -> i128 {
+        self.data.utilization(e)
+    }
 
-        if accrued > 0 {
-            // credit the backstop underlying from the accrued interest based on the backstop rate
-            // update the accrued interest to reflect the amount the pool accrued
-            let mut new_backstop_credit: i128 = 0;
-            if bstop_rate > 0 {
-                new_backstop_credit = accrued.fixed_mul_floor(e, &i128(bstop_rate), &SCALAR_7);
-                self.data.backstop_credit += new_backstop_credit;
-            }
-            self.data.b_rate = (pre_update_supply + accrued - new_backstop_credit).fixed_div_floor(
-                e,
-                &self.data.b_supply,
-                &SCALAR_12,
-            );
+    /// Require that the utilization rate is at or below the maximum allowed, or panic.
+    pub fn require_utilization_below_max(&self, e: &Env) {
+        if !utilization_within_max(self.utilization(e), self.config.max_util) {
+            panic_with_error!(e, PoolError::InvalidUtilRate)
         }
     }
 
-    /// Fetch the current utilization rate for the reserve normalized to 7 decimals
-    pub fn utilization(&self, e: &Env) -> i128 {
-        self.total_liabilities(e)
-            .fixed_div_ceil(e, &self.total_supply(e), &SCALAR_7)
-    }
-
-    /// Require that the utilization rate is below the maximum allowed, or panic.
-    pub fn require_utilization_below_max(&self, e: &Env) {
-        if self.utilization(e) > i128(self.config.max_util) {
+    /// Require that the utilization rate is below 100%, or panic.
+    ///
+    /// Used to validate that the reserve has enough liquidity to support the requested action,
+    /// as some tokens held by the pool are reserved for the backstop.
+    pub fn require_utilization_below_100(&self, e: &Env) {
+        if !utilization_below_100(self.utilization(e)) {
             panic_with_error!(e, PoolError::InvalidUtilRate)
         }
     }
@@ -125,14 +125,8 @@ impl Reserve {
     /// ### Arguments
     /// * `action_type` - The type of action being performed
     pub fn require_action_allowed(&self, e: &Env, action_type: u32) {
-        // disable borrowing or auction cancellation for any non-active pool and disable supplying for any frozen pool
-        if !self.config.enabled {
-            if action_type == RequestType::Supply as u32
-                || action_type == RequestType::SupplyCollateral as u32
-                || action_type == RequestType::Borrow as u32
-            {
-                panic_with_error!(e, PoolError::ReserveDisabled);
-            }
+        if !reserve_action_allowed(self.config.enabled, action_type) {
+            panic_with_error!(e, PoolError::ReserveDisabled);
         }
     }
 
@@ -153,7 +147,7 @@ impl Reserve {
     /// ### Arguments
     /// * `d_tokens` - The amount of tokens to convert
     pub fn to_asset_from_d_token(&self, e: &Env, d_tokens: i128) -> i128 {
-        d_tokens.fixed_mul_ceil(e, &self.data.d_rate, &SCALAR_12)
+        self.data.to_asset_from_d_token(e, d_tokens)
     }
 
     /// Convert b_tokens to the corresponding asset value
@@ -161,7 +155,7 @@ impl Reserve {
     /// ### Arguments
     /// * `b_tokens` - The amount of tokens to convert
     pub fn to_asset_from_b_token(&self, e: &Env, b_tokens: i128) -> i128 {
-        b_tokens.fixed_mul_floor(e, &self.data.b_rate, &SCALAR_12)
+        self.data.to_asset_from_b_token(e, b_tokens)
     }
 
     /// Convert d_tokens to their corresponding effective asset value. This
@@ -189,7 +183,7 @@ impl Reserve {
     /// ### Arguments
     /// * `amount` - The amount of tokens to convert
     pub fn to_d_token_up(&self, e: &Env, amount: i128) -> i128 {
-        amount.fixed_div_ceil(e, &self.data.d_rate, &SCALAR_12)
+        self.data.to_d_token_up(e, amount)
     }
 
     /// Convert asset tokens to the corresponding d token value - rounding down
@@ -197,7 +191,7 @@ impl Reserve {
     /// ### Arguments
     /// * `amount` - The amount of tokens to convert
     pub fn to_d_token_down(&self, e: &Env, amount: i128) -> i128 {
-        amount.fixed_div_floor(e, &self.data.d_rate, &SCALAR_12)
+        self.data.to_d_token_down(e, amount)
     }
 
     /// Convert asset tokens to the corresponding b token value - round up
@@ -205,7 +199,7 @@ impl Reserve {
     /// ### Arguments
     /// * `amount` - The amount of tokens to convert
     pub fn to_b_token_up(&self, e: &Env, amount: i128) -> i128 {
-        amount.fixed_div_ceil(e, &self.data.b_rate, &SCALAR_12)
+        self.data.to_b_token_up(e, amount)
     }
 
     /// Convert asset tokens to the corresponding b token value - round down
@@ -213,9 +207,99 @@ impl Reserve {
     /// ### Arguments
     /// * `amount` - The amount of tokens to convert
     pub fn to_b_token_down(&self, e: &Env, amount: i128) -> i128 {
-        amount.fixed_div_floor(e, &self.data.b_rate, &SCALAR_12)
+        self.data.to_b_token_down(e, amount)
     }
 }
+
+fn utilization_within_max(utilization: i128, maximum: u32) -> bool {
+    utilization <= i128(maximum)
+}
+
+fn utilization_below_100(utilization: i128) -> bool {
+    utilization < SCALAR_7
+}
+
+fn reserve_action_allowed(enabled: bool, action_type: u32) -> bool {
+    enabled
+        || !(action_type == RequestType::Supply as u32
+            || action_type == RequestType::SupplyCollateral as u32
+            || action_type == RequestType::Borrow as u32)
+}
+
+impl ReserveData {
+    pub(super) fn to_asset_from_b_token(&self, math: &impl FixedMath, amount: i128) -> i128 {
+        math.floor(amount, self.b_rate, SCALAR_12)
+    }
+
+    pub(super) fn to_asset_from_d_token(&self, math: &impl FixedMath, amount: i128) -> i128 {
+        math.ceil(amount, self.d_rate, SCALAR_12)
+    }
+
+    pub(super) fn to_b_token_down(&self, math: &impl FixedMath, amount: i128) -> i128 {
+        math.floor(amount, SCALAR_12, self.b_rate)
+    }
+
+    pub(super) fn to_b_token_up(&self, math: &impl FixedMath, amount: i128) -> i128 {
+        math.ceil(amount, SCALAR_12, self.b_rate)
+    }
+
+    pub(super) fn to_d_token_down(&self, math: &impl FixedMath, amount: i128) -> i128 {
+        math.floor(amount, SCALAR_12, self.d_rate)
+    }
+
+    pub(super) fn to_d_token_up(&self, math: &impl FixedMath, amount: i128) -> i128 {
+        math.ceil(amount, SCALAR_12, self.d_rate)
+    }
+
+    fn utilization(&self, math: &impl FixedMath) -> i128 {
+        let liabilities = self.to_asset_from_d_token(math, self.d_supply);
+        let supply = self.to_asset_from_b_token(math, self.b_supply);
+        if liabilities == 0 {
+            0
+        } else if liabilities >= supply {
+            SCALAR_7
+        } else {
+            math.ceil(liabilities, SCALAR_7, supply)
+        }
+    }
+
+    fn grow_debt(&mut self, math: &impl FixedMath, loan_accrual: i128) -> i128 {
+        let pre_update_liabilities = self.to_asset_from_d_token(math, self.d_supply);
+        self.d_rate = math.ceil(loan_accrual, self.d_rate, SCALAR_12);
+        self.to_asset_from_d_token(math, self.d_supply) - pre_update_liabilities
+    }
+
+    /// Accrue tokens to the reserve supply. This issues any `backstop_credit` required and updates the reserve's bRate to account for the additional tokens.
+    ///
+    /// ### Arguments
+    /// * bstop_rate - The backstop take rate for the pool
+    /// * accrued - The amount of additional underlying tokens
+    fn accrue(&mut self, math: &impl FixedMath, bstop_rate: u32, accrued: i128) {
+        let pre_update_supply = self.to_asset_from_b_token(math, self.b_supply);
+        if accrued > 0 {
+            let mut new_backstop_credit = 0;
+            if bstop_rate > 0 {
+                new_backstop_credit = math.floor(accrued, i128(bstop_rate), SCALAR_7);
+                self.backstop_credit += new_backstop_credit;
+            }
+            self.b_rate = math.floor(
+                pre_update_supply + accrued - new_backstop_credit,
+                SCALAR_12,
+                self.b_supply,
+            );
+        }
+    }
+
+    /// Burn supply shares directly. Settlement consumes this instead of a
+    /// bare field decrement; no additional guard or policy.
+    pub(super) fn burn_supply(&mut self, amount: i128) {
+        self.b_supply -= amount;
+    }
+}
+
+#[cfg(kani)]
+#[path = "../proofs/reserve.rs"]
+mod verification;
 
 #[cfg(test)]
 mod tests {
@@ -542,6 +626,51 @@ mod tests {
     }
 
     #[test]
+    fn test_utilization_empty() {
+        let e = Env::default();
+
+        let mut reserve = testutils::default_reserve(&e);
+        reserve.data.d_rate = 1_345_678_123_000;
+        reserve.data.b_rate = 1_123_456_789_000;
+        reserve.data.b_supply = 0;
+        reserve.data.d_supply = 0;
+
+        let result = reserve.utilization(&e);
+
+        assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn test_utilization_no_liabilities() {
+        let e = Env::default();
+
+        let mut reserve = testutils::default_reserve(&e);
+        reserve.data.d_rate = 1_345_678_123_000;
+        reserve.data.b_rate = 1_123_456_789_000;
+        reserve.data.b_supply = 1_1234567;
+        reserve.data.d_supply = 0;
+
+        let result = reserve.utilization(&e);
+
+        assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn test_utilization_more_liabilities() {
+        let e = Env::default();
+
+        let mut reserve = testutils::default_reserve(&e);
+        reserve.data.d_rate = 1_345_678_123_000;
+        reserve.data.b_rate = 1_123_456_789_000;
+        reserve.data.b_supply = 1_1234567;
+        reserve.data.d_supply = 2_1234567;
+
+        let result = reserve.utilization(&e);
+
+        assert_eq!(result, SCALAR_7);
+    }
+
+    #[test]
     fn test_require_utilization_below_max_pass() {
         let e = Env::default();
 
@@ -564,6 +693,31 @@ mod tests {
         reserve.data.d_supply = 95_0000100;
 
         reserve.require_utilization_below_max(&e);
+    }
+
+    #[test]
+    fn test_require_utilization_under_100_pass() {
+        let e = Env::default();
+
+        let mut reserve = testutils::default_reserve(&e);
+        reserve.data.b_supply = 100_0000000;
+        reserve.data.d_supply = 99_9000000;
+
+        reserve.require_utilization_below_100(&e);
+        // no panic
+        assert!(true);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #1207)")]
+    fn test_require_utilization_under_100_panic() {
+        let e = Env::default();
+
+        let mut reserve = testutils::default_reserve(&e);
+        reserve.data.b_supply = 100_0000000;
+        reserve.data.d_supply = 100_0000000;
+
+        reserve.require_utilization_below_100(&e);
     }
 
     /***** Token Transfer Math *****/
@@ -718,6 +872,17 @@ mod tests {
         let mut reserve = testutils::default_reserve(&e);
         reserve.config.enabled = false;
 
+        reserve.require_action_allowed(&e, RequestType::Supply as u32);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #1223)")]
+    fn test_require_action_allowed_panics_if_supply_collateral_disabled_asset() {
+        let e = Env::default();
+
+        let mut reserve = testutils::default_reserve(&e);
+        reserve.config.enabled = false;
+
         reserve.require_action_allowed(&e, RequestType::SupplyCollateral as u32);
     }
 
@@ -745,7 +910,7 @@ mod tests {
     }
 
     #[test]
-    fn test_gulp() {
+    fn test_accrue() {
         let e = Env::default();
         e.mock_all_auths();
 
@@ -763,14 +928,14 @@ mod tests {
         let mut reserve = testutils::default_reserve(&e);
         reserve.data.backstop_credit = 0_1234567;
 
-        reserve.gulp(&e, 0_2000000, 100_0000000);
+        reserve.data.accrue(&e, 0_2000000, 100_0000000);
         assert_eq!(reserve.data.backstop_credit, 20_0000000 + 0_1234567);
         assert_eq!(reserve.data.b_rate, 1_800_000_000_000);
         assert_eq!(reserve.data.last_time, 0);
     }
 
     #[test]
-    fn test_gulp_negative_delta_no_change() {
+    fn test_accrue_negative_delta_no_change() {
         let e = Env::default();
         e.mock_all_auths();
 
@@ -788,9 +953,13 @@ mod tests {
         let mut reserve = testutils::default_reserve(&e);
         reserve.data.backstop_credit = 0_1234567;
 
-        reserve.gulp(&e, 0_2000000, -10_0000000);
+        reserve.data.accrue(&e, 0_2000000, -10_0000000);
         assert_eq!(reserve.data.backstop_credit, 0_1234567);
         assert_eq!(reserve.data.b_rate, 1_000_000_000_000);
         assert_eq!(reserve.data.last_time, 0);
     }
 }
+
+#[cfg(kani)]
+#[path = "../proofs/inverse_partitions.rs"]
+mod inverse_partitions;

@@ -28,7 +28,20 @@ pub struct PoolConfig {
     pub min_collateral: i128, // the minimum amount of collateral required to open a liability position
     pub bstop_rate: u32, // the rate the backstop takes on accrued debt interest, expressed in 7 decimals
     pub status: u32,     // the status of the pool
-    pub max_positions: u32, // the maximum number of effective positions (collateral + liabilities) a single user can hold
+    pub max_positions: u32, // the maximum number of effective positions a single user can hold, and the max assets an auction can contain
+}
+
+#[cfg(feature = "certora")]
+impl cvlr::nondet::Nondet for PoolConfig {
+    fn nondet() -> Self {
+        Self {
+            oracle: cvlr_soroban::nondet_address(),
+            min_collateral: cvlr::nondet(),
+            bstop_rate: cvlr::nondet(),
+            status: cvlr::nondet(),
+            max_positions: cvlr::nondet(),
+        }
+    }
 }
 
 /// The pool's emission config
@@ -43,19 +56,42 @@ pub struct PoolEmissionConfig {
 #[derive(Clone, Debug)]
 #[contracttype]
 pub struct ReserveConfig {
-    pub index: u32,           // the index of the reserve in the list
-    pub decimals: u32,        // the decimals used in both the bToken and underlying contract
-    pub c_factor: u32, // the collateral factor for the reserve scaled expressed in 7 decimals
-    pub l_factor: u32, // the liability factor for the reserve scaled expressed in 7 decimals
-    pub util: u32,     // the target utilization rate scaled expressed in 7 decimals
-    pub max_util: u32, // the maximum allowed utilization rate scaled expressed in 7 decimals
+    pub index: u32,         // the index of the reserve in the list
+    pub decimals: u32,      // the decimals used in both the bToken and underlying contract
+    pub c_factor: u32,      // the collateral factor for the reserve scaled expressed in 7 decimals
+    pub l_factor: u32,      // the liability factor for the reserve scaled expressed in 7 decimals
+    pub util: u32,          // the target utilization rate scaled expressed in 7 decimals
+    pub max_util: u32,      // the maximum allowed utilization rate scaled expressed in 7 decimals
     pub r_base: u32, // the R0 value (base rate) in the interest rate formula scaled expressed in 7 decimals
     pub r_one: u32,  // the R1 value in the interest rate formula scaled expressed in 7 decimals
     pub r_two: u32,  // the R2 value in the interest rate formula scaled expressed in 7 decimals
     pub r_three: u32, // the R3 value in the interest rate formula scaled expressed in 7 decimals
     pub reactivity: u32, // the reactivity constant for the reserve scaled expressed in 7 decimals
-    pub collateral_cap: i128, // the total amount of underlying tokens that can be used as collateral
-    pub enabled: bool,        // the enabled flag of the reserve
+    pub supply_cap: i128, // the total amount of underlying tokens that can be supplied to the reserve
+    pub min_position: i128, // minimum underlying amount a nonzero collateral position in this reserve must hold; 0 disables
+    pub enabled: bool,      // the enabled flag of the reserve
+}
+
+#[cfg(feature = "certora")]
+impl cvlr::nondet::Nondet for ReserveConfig {
+    fn nondet() -> Self {
+        Self {
+            index: cvlr::nondet(),
+            decimals: cvlr::nondet(),
+            c_factor: cvlr::nondet(),
+            l_factor: cvlr::nondet(),
+            util: cvlr::nondet(),
+            max_util: cvlr::nondet(),
+            r_base: cvlr::nondet(),
+            r_one: cvlr::nondet(),
+            r_two: cvlr::nondet(),
+            r_three: cvlr::nondet(),
+            reactivity: cvlr::nondet(),
+            supply_cap: cvlr::nondet(),
+            min_position: cvlr::nondet(),
+            enabled: cvlr::nondet(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -78,6 +114,21 @@ pub struct ReserveData {
     pub last_time: u64, // the last block the data was updated
 }
 
+#[cfg(feature = "certora")]
+impl cvlr::nondet::Nondet for ReserveData {
+    fn nondet() -> Self {
+        Self {
+            d_rate: cvlr::nondet(),
+            b_rate: cvlr::nondet(),
+            ir_mod: cvlr::nondet(),
+            b_supply: cvlr::nondet(),
+            d_supply: cvlr::nondet(),
+            backstop_credit: cvlr::nondet(),
+            last_time: cvlr::nondet(),
+        }
+    }
+}
+
 /// The emission data for the reserve b or d token
 #[derive(Clone)]
 #[contracttype]
@@ -86,6 +137,18 @@ pub struct ReserveEmissionData {
     pub eps: u64,
     pub index: i128,
     pub last_time: u64,
+}
+
+#[cfg(feature = "certora")]
+impl cvlr::nondet::Nondet for ReserveEmissionData {
+    fn nondet() -> Self {
+        Self {
+            expiration: cvlr::nondet(),
+            eps: cvlr::nondet(),
+            index: cvlr::nondet(),
+            last_time: cvlr::nondet(),
+        }
+    }
 }
 
 /// The user emission data for the reserve b or d token
@@ -99,6 +162,7 @@ pub struct UserEmissionData {
 /********** Storage Key Types **********/
 
 const ADMIN_KEY: &str = "Admin";
+const PROPOSED_ADMIN_KEY: &str = "PropAdmin";
 const NAME_KEY: &str = "Name";
 const BACKSTOP_KEY: &str = "Backstop";
 const BLND_TOKEN_KEY: &str = "BLNDTkn";
@@ -200,7 +264,7 @@ pub fn set_user_positions(e: &Env, user: &Address, positions: &Positions) {
 
 /********** Admin **********/
 
-// Fetch the current admin Address
+/// Fetch the current admin Address
 ///
 /// ### Panics
 /// If the admin does not exist
@@ -219,6 +283,40 @@ pub fn set_admin(e: &Env, new_admin: &Address) {
     e.storage()
         .instance()
         .set::<Symbol, Address>(&Symbol::new(e, ADMIN_KEY), new_admin);
+}
+
+/// Fetch the current proposed admin Address
+///
+/// A proposal expires 10 days after it is made. The expiry is stored with the
+/// address, since the TTL of a temporary entry can be extended by anyone. An
+/// expired proposal is treated as if it does not exist.
+pub fn get_proposed_admin(e: &Env) -> Option<Address> {
+    let (proposed_admin, expiry_ledger): (Address, u32) = e
+        .storage()
+        .temporary()
+        .get(&Symbol::new(e, PROPOSED_ADMIN_KEY))?;
+    if e.ledger().sequence() > expiry_ledger {
+        None
+    } else {
+        Some(proposed_admin)
+    }
+}
+
+/// Set a new proposed admin. The proposal expires 10 days after it is made.
+///
+/// ### Arguments
+/// * `proposed_admin` - The Address for the proposed admin
+pub fn set_proposed_admin(e: &Env, proposed_admin: &Address) {
+    let expiry_ledger = e.ledger().sequence() + 10 * ONE_DAY_LEDGERS;
+    e.storage().temporary().set::<Symbol, (Address, u32)>(
+        &Symbol::new(e, PROPOSED_ADMIN_KEY),
+        &(proposed_admin.clone(), expiry_ledger),
+    );
+    e.storage().temporary().extend_ttl(
+        &Symbol::new(e, PROPOSED_ADMIN_KEY),
+        10 * ONE_DAY_LEDGERS,
+        10 * ONE_DAY_LEDGERS,
+    );
 }
 
 /********** Metadata **********/
@@ -533,7 +631,10 @@ pub fn set_user_emissions(e: &Env, user: &Address, res_token_index: &u32, data: 
     });
     e.storage()
         .persistent()
-        .set::<PoolDataKey, UserEmissionData>(&key, data)
+        .set::<PoolDataKey, UserEmissionData>(&key, data);
+    e.storage()
+        .persistent()
+        .extend_ttl(&key, LEDGER_THRESHOLD_USER, LEDGER_BUMP_USER);
 }
 
 /********** Pool Emissions **********/

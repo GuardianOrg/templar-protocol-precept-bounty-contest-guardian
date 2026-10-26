@@ -1,7 +1,8 @@
-use soroban_fixed_point_math::SorobanFixedPoint;
+use crate::{
+    constants::SCALAR_12, emissions, math::FixedMath, storage, storage::ReserveData,
+    validator::require_nonnegative, PoolError,
+};
 use soroban_sdk::{contracttype, panic_with_error, Address, Env, Map};
-
-use crate::{constants::SCALAR_12, emissions, storage, validator::require_nonnegative, PoolError};
 
 use super::{Pool, Reserve};
 
@@ -12,6 +13,17 @@ pub struct Positions {
     pub liabilities: Map<u32, i128>, // Map of Reserve Index to liability share balance
     pub collateral: Map<u32, i128>,  // Map of Reserve Index to collateral supply share balance
     pub supply: Map<u32, i128>,      // Map of Reserve Index to non-collateral supply share balance
+}
+
+#[cfg(feature = "certora")]
+impl cvlr::nondet::Nondet for Positions {
+    fn nondet() -> Self {
+        Self {
+            liabilities: cvlr_soroban::nondet_map(),
+            collateral: cvlr_soroban::nondet_map(),
+            supply: cvlr_soroban::nondet_map(),
+        }
+    }
 }
 
 impl Positions {
@@ -38,6 +50,16 @@ impl Positions {
 pub struct User {
     pub address: Address,
     pub positions: Positions,
+}
+
+#[cfg(feature = "certora")]
+impl cvlr::nondet::Nondet for User {
+    fn nondet() -> Self {
+        Self {
+            address: cvlr_soroban::nondet_address(),
+            positions: cvlr::nondet(),
+        }
+    }
 }
 
 impl User {
@@ -102,17 +124,18 @@ impl User {
     /// against the balance if necessary and updates the reserve's b_rate and d_supply.
     ///
     /// This should only be called if the liabilities are being defaulted on. The liability will
-    /// be forgiven and suppliers will lose funds.
+    /// be forgiven and outstanding suppliers will lose funds. With no supplier claims,
+    /// preserve b_rate while clearing the debt.
     pub fn default_liabilities(&mut self, e: &Env, reserve: &mut Reserve, amount: i128) {
         self.remove_liabilities(e, reserve, amount);
-        // determine amount of funds in underlying that have defaulted
-        // and deduct them from the b_rate
-        let default_amount = reserve.to_asset_from_d_token(e, amount);
-        let b_rate_loss = default_amount.fixed_div_ceil(&e, &reserve.data.b_supply, &SCALAR_12);
-        reserve.data.b_rate -= b_rate_loss;
-        if reserve.data.b_rate < 0 {
-            reserve.data.b_rate = 0;
-        }
+        // Only outstanding supplier claims absorb the default.
+        let new_rate = default_b_rate(e, &reserve.data, amount);
+        reserve.data.b_rate = new_rate;
+    }
+
+    /// Check if the user has collateral
+    pub fn has_collateral(&self) -> bool {
+        !self.positions.collateral.is_empty()
     }
 
     /// Get the collateralized blendToken position for the reserve at the given index
@@ -151,7 +174,7 @@ impl User {
                 .collateral
                 .set(reserve.config.index, new_balance);
         }
-        reserve.data.b_supply -= amount;
+        reserve.data.burn_supply(amount);
     }
 
     /// Get the uncollateralized blendToken position for the reserve at the given index
@@ -188,7 +211,7 @@ impl User {
         } else {
             self.positions.supply.set(reserve.config.index, new_balance);
         }
-        reserve.data.b_supply -= amount;
+        reserve.data.burn_supply(amount);
     }
 
     /// Get the total supply and collateral of blendTokens for the user at the given index
@@ -245,6 +268,16 @@ impl User {
     }
 
     fn update_d_emissions(&self, e: &Env, reserve: &Reserve, amount: i128) {
+        #[cfg(feature = "certora")]
+        crate::spec::summaries::emissions::update_emissions_summary(
+            e,
+            reserve.config.index * 2,
+            reserve.data.d_supply,
+            reserve.scalar,
+            &self.address,
+            amount,
+        );
+        #[cfg(not(feature = "certora"))]
         emissions::update_emissions(
             e,
             reserve.config.index * 2,
@@ -256,6 +289,16 @@ impl User {
     }
 
     fn update_b_emissions(&self, e: &Env, reserve: &Reserve, amount: i128) {
+        #[cfg(feature = "certora")]
+        crate::spec::summaries::emissions::update_emissions_summary(
+            e,
+            reserve.config.index * 2 + 1,
+            reserve.data.b_supply,
+            reserve.scalar,
+            &self.address,
+            amount,
+        );
+        #[cfg(not(feature = "certora"))]
         emissions::update_emissions(
             e,
             reserve.config.index * 2 + 1,
@@ -267,6 +310,22 @@ impl User {
     }
 }
 
+/// The b_rate after a default of `defaulted` d-tokens: outstanding suppliers
+/// absorb the ceil-rounded underlying loss; with no supplier claims the
+/// existing rate is preserved without reaching the division.
+fn default_b_rate(math: &impl FixedMath, reserve: &ReserveData, defaulted: i128) -> i128 {
+    if reserve.b_supply > 0 {
+        let default_amount = reserve.to_asset_from_d_token(math, defaulted);
+        let b_rate_loss = math.ceil(default_amount, SCALAR_12, reserve.b_supply);
+        let new_rate = reserve.b_rate - b_rate_loss;
+        if new_rate < 0 {
+            return 0;
+        }
+        return new_rate;
+    }
+    reserve.b_rate
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -276,6 +335,267 @@ mod tests {
         map,
         testutils::{Address as _, Ledger, LedgerInfo},
     };
+
+    fn skip_token(b: &[u8], i: usize) -> usize {
+        match b[i] {
+            b'/' if b.get(i + 1) == Some(&b'/') => {
+                let mut j = i + 2;
+                while j < b.len() && b[j] != b'\n' {
+                    j += 1;
+                }
+                j
+            }
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                let mut j = i + 2;
+                while j + 1 < b.len() && !(b[j] == b'*' && b[j + 1] == b'/') {
+                    j += 1;
+                }
+                (j + 2).min(b.len())
+            }
+            b'r' if matches!(b.get(i + 1), Some(&b'"') | Some(&b'#')) => {
+                let mut hashes = 0;
+                while b.get(i + 1 + hashes) == Some(&b'#') {
+                    hashes += 1;
+                }
+                if b.get(i + 1 + hashes) != Some(&b'"') {
+                    return i + 1;
+                }
+                let mut j = i + 2 + hashes;
+                while j < b.len() {
+                    if b[j] == b'"' && (1..=hashes).all(|k| b.get(j + k) == Some(&b'#')) {
+                        return j + 1 + hashes;
+                    }
+                    j += 1;
+                }
+                b.len()
+            }
+            b'"' => {
+                let mut j = i + 1;
+                while j < b.len() {
+                    match b[j] {
+                        b'\\' => j += 2,
+                        b'"' => return j + 1,
+                        _ => j += 1,
+                    }
+                }
+                b.len()
+            }
+            // a lifetime is not a literal, so only accept a quote that closes soon
+            b'\'' => {
+                let mut j = i + 1;
+                while j < b.len() && j <= i + 4 {
+                    match b[j] {
+                        b'\\' => j += 2,
+                        b'\'' => return j + 1,
+                        _ => j += 1,
+                    }
+                }
+                i + 1
+            }
+            _ => i + 1,
+        }
+    }
+
+    /// Excises `#[cfg(test)] mod`, inline or out-of-line, and panics on any
+    /// other shape: guessing an item's extent hides the writes after it.
+    fn production(src: &str) -> std::string::String {
+        const MARKER: &[u8] = b"#[cfg(test)]";
+        let b = src.as_bytes();
+        let mut kept = std::string::String::new();
+        let mut copy_from = 0;
+        let mut i = 0;
+        while i < b.len() {
+            if !b[i..].starts_with(MARKER) {
+                i = skip_token(b, i);
+                continue;
+            }
+            kept.push_str(&src[copy_from..i]);
+            let mut j = i + MARKER.len();
+            while j < b.len() && b[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            assert!(
+                b[j..].starts_with(b"mod ") || b[j..].starts_with(b"pub mod "),
+                "only `#[cfg(test)] mod` is excised; extend production() for {:?}",
+                src[j..].chars().take(40).collect::<std::string::String>()
+            );
+            // `mod x { .. }` and `mod x;` are the only two forms
+            while j < b.len() && b[j] != b'{' && b[j] != b';' {
+                j = skip_token(b, j);
+            }
+            assert!(j < b.len(), "unterminated #[cfg(test)] mod");
+            if b[j] == b';' {
+                i = j + 1;
+                copy_from = i;
+                continue;
+            }
+            let mut depth = 0usize;
+            loop {
+                assert!(j < b.len(), "unbalanced braces in a #[cfg(test)] mod");
+                match b[j] {
+                    b'{' => {
+                        depth += 1;
+                        j += 1;
+                    }
+                    b'}' => {
+                        depth -= 1;
+                        j += 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    _ => j = skip_token(b, j),
+                }
+            }
+            i = j;
+            copy_from = j;
+        }
+        kept.push_str(&src[copy_from..]);
+        kept
+    }
+
+    fn writes(src: &str) -> (usize, usize, usize) {
+        let (mut inc, mut dec, mut set) = (0, 0, 0);
+        let mut rest = src;
+        while let Some(i) = rest.find("b_supply") {
+            rest = &rest[i + "b_supply".len()..];
+            let tail = rest.trim_start();
+            if tail.starts_with("+=") {
+                inc += 1;
+            } else if tail.starts_with("-=") {
+                dec += 1;
+            } else if tail.starts_with("==") {
+            } else if tail.starts_with('=')
+                || tail.starts_with("*=")
+                || tail.starts_with("/=")
+                || tail.starts_with("%=")
+            {
+                set += 1;
+            }
+        }
+        (inc, dec, set)
+    }
+
+    /// The supply-cap argument in `docs/kani.md` enumerates every production
+    /// writer of `b_supply` and shows each is either behind the cap guard or
+    /// paired with an equal decrease on the same reserve. That enumeration is a
+    /// reading of the code; this pins it. If a count below changes, the new
+    /// site has to be checked against the same two cases before the supply-cap
+    /// claim still holds.
+    #[test]
+    fn test_b_supply_writers_are_enumerated() {
+        let src_root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src"));
+        let mut found = std::collections::BTreeMap::new();
+        let mut stack = std::vec![src_root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    // proofs/ and spec/ write b_supply by design, outside production
+                    let name = path.file_name().and_then(|n| n.to_str());
+                    if !matches!(name, Some("proofs") | Some("spec")) {
+                        stack.push(path);
+                    }
+                    continue;
+                }
+                if path.extension().map_or(true, |e| e != "rs") {
+                    continue;
+                }
+                let counts = writes(&production(&std::fs::read_to_string(&path).unwrap()));
+                if counts != (0, 0, 0) {
+                    let rel = path.strip_prefix(src_root).unwrap();
+                    found.insert(rel.to_string_lossy().replace('\\', "/"), counts);
+                }
+            }
+        }
+
+        let found: std::vec::Vec<(&str, (usize, usize, usize))> =
+            found.iter().map(|(p, c)| (p.as_str(), *c)).collect();
+        assert_eq!(
+            found,
+            [("pool/reserve.rs", (0, 1, 0)), ("pool/user.rs", (2, 0, 0))],
+            "a new b_supply writer must be checked against the cap guard and \
+             paired-decrease cases in docs/kani.md before the supply-cap claim holds"
+        );
+    }
+
+    /// The scanner decides what counts as production code, so its own failure
+    /// modes are pinned here rather than by hand. Every shape below hides a
+    /// write from `test_b_supply_writers_are_enumerated` if excision guesses
+    /// the item's extent wrong.
+    #[test]
+    fn test_production_rejects_unsupported_cfg_test_shapes() {
+        let unsupported = [
+            "struct S { a: i32, #[cfg(test)] b: i32, }\nfn p() { d.b_supply += a; }",
+            "enum E { A, #[cfg(test)] B, }\nfn p() { d.b_supply += a; }",
+            "fn f() { match x { 1 => 1, #[cfg(test)] 2 => 2, _ => 0 } }\nfn p() { d.b_supply += a; }",
+            "#[cfg(test)]\nuse other::Thing;\nfn p() { d.b_supply += a; }",
+            "#[cfg(test)]\nextern crate std;\nfn p() { d.b_supply -= a; }",
+            "#[cfg(test)]\nimpl Foo { fn t() {} }\nfn p() { d.b_supply += a; }",
+        ];
+        // `is_err()` alone would accept an unrelated panic, such as a slicing
+        // bug, as a correct rejection
+        const WANT: &str = "only `#[cfg(test)] mod` is excised";
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(std::boxed::Box::new(|_| {}));
+        let outcomes: std::vec::Vec<bool> = unsupported
+            .iter()
+            .map(|src| {
+                std::panic::catch_unwind(|| production(src))
+                    .err()
+                    .and_then(|p| p.downcast_ref::<std::string::String>().cloned())
+                    .is_some_and(|m| m.contains(WANT))
+            })
+            .collect();
+        std::panic::set_hook(prev);
+        assert!(
+            outcomes.iter().all(|rejected| *rejected),
+            "these shapes were not rejected by the whitelist: {:?}",
+            unsupported
+                .iter()
+                .zip(&outcomes)
+                .filter(|(_, ok)| !**ok)
+                .map(|(src, _)| *src)
+                .collect::<std::vec::Vec<_>>()
+        );
+    }
+
+    /// Braces inside strings, raw strings, char literals and comments must not
+    /// extend a test module past its closing brace.
+    #[test]
+    fn test_production_keeps_writes_after_test_modules() {
+        let fixtures = [
+            "#[cfg(test)]\nmod tests { fn t() { let s = \"{\"; } }\nfn p() { d.b_supply += a; }",
+            "#[cfg(test)]\nmod tests { fn t() { let s = \"}\"; } }\nfn p() { d.b_supply += a; }",
+            "#[cfg(test)]\nmod tests { fn t() {} // {{{\n}\nfn p() { d.b_supply += a; }",
+            "#[cfg(test)]\nmod tests { fn t() { let c = '{'; } }\nfn p() { d.b_supply += a; }",
+            "#[cfg(test)]\nmod tests { fn t() { let s = r#\"{ \" {\"#; } }\nfn p() { d.b_supply += a; }",
+            "#[cfg(test)]\npub mod tests { fn t() {} }\nfn p() { d.b_supply += a; }",
+            "#[cfg(test)]\nmod tests;\nfn p() { d.b_supply += a; }",
+            "#[cfg(test)]\npub mod tests;\nfn p() { d.b_supply += a; }",
+        ];
+        for src in fixtures {
+            assert_eq!(
+                writes(&production(src)),
+                (1, 0, 0),
+                "excision swallowed the production write in {src:?}"
+            );
+        }
+        assert_eq!(
+            writes(&production(
+                "#[cfg(test)]\nmod tests { fn t() { d.b_supply += a; } }\nfn p() {}"
+            )),
+            (0, 0, 0),
+            "a write inside a test module must not be counted"
+        );
+        assert_eq!(
+            writes(&production(
+                "#[cfg(test)]\nmod tests {}\nfn p() { d.b_supply = d.b_supply + a; }"
+            )),
+            (0, 0, 1),
+            "plain assignment must be counted in its own column"
+        );
+    }
 
     #[test]
     fn test_load_and_store() {
@@ -598,6 +918,31 @@ mod tests {
     }
 
     #[test]
+    fn test_default_liabilities_without_suppliers_preserves_b_rate() {
+        let e = Env::default();
+        e.mock_all_auths();
+        let pool = testutils::create_pool(&e);
+        let mut reserve = testutils::default_reserve(&e);
+        reserve.data.d_supply = 0;
+        reserve.data.b_supply = 0;
+        reserve.data.b_rate = 1_250_000_000_000;
+        let mut user = User {
+            address: Address::generate(&e),
+            positions: Positions::env_default(&e),
+        };
+
+        e.as_contract(&pool, || {
+            user.add_liabilities(&e, &mut reserve, 20_0000000);
+            user.default_liabilities(&e, &mut reserve, 20_0000000);
+
+            assert!(!user.has_liabilities());
+            assert_eq!(reserve.data.d_supply, 0);
+            assert_eq!(reserve.data.b_supply, 0);
+            assert_eq!(reserve.data.b_rate, 1_250_000_000_000);
+        });
+    }
+
+    #[test]
     fn test_default_liabilities_reduces_b_rate_to_zero() {
         let e = Env::default();
         e.mock_all_auths();
@@ -691,24 +1036,35 @@ mod tests {
         };
         e.as_contract(&pool, || {
             assert_eq!(user.get_collateral(0), 0);
+            assert_eq!(user.has_collateral(), false);
 
             user.add_collateral(&e, &mut reserve_0, 123);
             assert_eq!(user.get_collateral(0), 123);
             assert_eq!(reserve_0.data.b_supply, starting_b_supply_0 + 123);
+            assert_eq!(user.has_collateral(), true);
 
             user.add_collateral(&e, &mut reserve_1, 456);
             assert_eq!(user.get_collateral(0), 123);
             assert_eq!(user.get_collateral(1), 456);
             assert_eq!(reserve_1.data.b_supply, starting_b_supply_1 + 456);
+            assert_eq!(user.has_collateral(), true);
 
             user.remove_collateral(&e, &mut reserve_1, 100);
             assert_eq!(user.get_collateral(1), 356);
             assert_eq!(reserve_1.data.b_supply, starting_b_supply_1 + 356);
+            assert_eq!(user.has_collateral(), true);
 
             user.remove_collateral(&e, &mut reserve_1, 356);
             assert_eq!(user.get_collateral(1), 0);
             assert_eq!(user.positions.collateral.len(), 1);
             assert_eq!(reserve_1.data.b_supply, starting_b_supply_1);
+            assert_eq!(user.has_collateral(), true);
+
+            user.remove_collateral(&e, &mut reserve_0, 123);
+            assert_eq!(user.get_collateral(0), 0);
+            assert_eq!(user.positions.collateral.len(), 0);
+            assert_eq!(reserve_0.data.b_supply, starting_b_supply_0);
+            assert_eq!(user.has_collateral(), false);
         });
     }
 
@@ -1192,3 +1548,7 @@ mod tests {
         });
     }
 }
+
+#[cfg(kani)]
+#[path = "../proofs/user.rs"]
+mod verification;

@@ -1,8 +1,6 @@
 use crate::{
     backstop::{self, load_pool_backstop_data, PoolBackstopData, UserBalance, Q4W},
     constants::{MAX_BACKFILLED_EMISSIONS, SCALAR_7},
-    dependencies::EmitterClient,
-    emissions,
     errors::BackstopError,
     events::BackstopEvents,
     storage,
@@ -19,7 +17,7 @@ pub struct BackstopContract;
 pub trait Backstop {
     /********** Core **********/
 
-    /// Deposit backstop tokens from "from" into the backstop of a pool
+    /// Deposit backstop tokens from `from` into the backstop of a pool
     ///
     /// Returns the number of backstop pool shares minted
     ///
@@ -29,7 +27,7 @@ pub trait Backstop {
     /// * `amount` - The amount of tokens to deposit
     fn deposit(e: Env, from: Address, pool_address: Address, amount: i128) -> i128;
 
-    /// Queue deposited pool shares from "from" for withdraw from a backstop of a pool
+    /// Queue deposited pool shares from `from` for withdraw from a backstop of a pool
     ///
     /// Returns the created queue for withdrawal
     ///
@@ -39,7 +37,7 @@ pub trait Backstop {
     /// * `amount` - The amount of shares to queue for withdraw
     fn queue_withdrawal(e: Env, from: Address, pool_address: Address, amount: i128) -> Q4W;
 
-    /// Dequeue a currently queued pool share withdraw for "form" from the backstop of a pool
+    /// Dequeue a currently queued pool share withdraw for `from` from the backstop of a pool
     ///
     /// ### Arguments
     /// * `from` - The address whose deposits are being queued for withdrawal
@@ -47,7 +45,7 @@ pub trait Backstop {
     /// * `amount` - The amount of shares to dequeue
     fn dequeue_withdrawal(e: Env, from: Address, pool_address: Address, amount: i128);
 
-    /// Withdraw shares from "from"s withdraw queue for a backstop of a pool
+    /// Withdraw shares from `from`s withdraw queue for a backstop of a pool
     ///
     /// Returns the amount of tokens returned
     ///
@@ -75,6 +73,9 @@ pub trait Backstop {
     /// Fetch the backstop token for the backstop
     fn backstop_token(e: Env) -> Address;
 
+    /// Fetch the reward zone for the backstop
+    fn reward_zone(e: Env) -> Vec<Address>;
+
     /********** Emissions **********/
 
     /// Update the backstop with new emissions for all reward zone pools
@@ -100,7 +101,7 @@ pub trait Backstop {
     /// * `to_remove` - The address of the pool to remove (Optional - Used if the reward zone is full)
     ///
     /// ### Errors
-    /// If the pool to remove has more tokens, or if distribution occurred in the last 48 hours
+    /// If the pool to remove has more tokens, or if distribute has not occured in the last hour
     fn add_reward(e: Env, to_add: Address, to_remove: Option<Address>);
 
     /// Remove a pool from the reward zone
@@ -114,16 +115,16 @@ pub trait Backstop {
 
     /// Claim backstop deposit emissions from a list of pools for `from`
     ///
-    /// Returns the amount of BLND emissions claimed
+    /// Returns the amount of LP tokens minted
     ///
     /// ### Arguments
     /// * `from` - The address of the user claiming emissions
     /// * `pool_addresses` - The Vec of addresses to claim backstop deposit emissions from
-    /// * `to` - The Address to send to emissions to
+    /// * `min_lp_tokens_out` - The minimum amount of LP tokens to mint with the claimed BLND
     ///
     /// ### Errors
     /// If an invalid pool address is included
-    fn claim(e: Env, from: Address, pool_addresses: Vec<Address>, to: Address) -> i128;
+    fn claim(e: Env, from: Address, pool_addresses: Vec<Address>, min_lp_tokens_out: i128) -> i128;
 
     /// Drop initial BLND to a list of addresses through the emitter
     fn drop(e: Env);
@@ -143,12 +144,12 @@ pub trait Backstop {
     /// not authorize the call
     fn draw(e: Env, pool_address: Address, amount: i128, to: Address);
 
-    /// (Only Pool) Sends backstop tokens from "from" to a pools backstop
+    /// (Only Pool) Sends backstop tokens from `from` to a pools backstop
     ///
-    /// NOTE: This is not a deposit, and "from" will permanently lose access to the funds
+    /// NOTE: This is not a deposit, and `from` will permanently lose access to the funds
     ///
     /// ### Arguments
-    /// * `from` - tge
+    /// * `from` - The address of the pool donating tokens to the backstop
     /// * `pool_address` - The address of the pool
     /// * `amount` - The amount of BLND to add
     ///
@@ -252,55 +253,34 @@ impl Backstop for BackstopContract {
         storage::get_backstop_token(&e)
     }
 
+    fn reward_zone(e: Env) -> Vec<Address> {
+        storage::get_reward_zone(&e)
+    }
+
     /********** Emissions **********/
 
     fn distribute(e: Env) -> i128 {
-        storage::extend_instance(&e);
-        let new_emissions = emissions::distribute(&e);
-
-        BackstopEvents::distribute(&e, new_emissions);
-        new_emissions
+        panic_with_error!(&e, BackstopError::BadRequest);
     }
 
     fn gulp_emissions(e: Env, pool: Address) -> i128 {
-        storage::extend_instance(&e);
-        pool.require_auth();
-        let (backstop_emissions, pool_emissions) = emissions::gulp_emissions(&e, &pool);
-
-        BackstopEvents::gulp_emissions(&e, pool, backstop_emissions, pool_emissions);
-        pool_emissions
+        panic_with_error!(&e, BackstopError::BadRequest);
     }
 
     fn add_reward(e: Env, to_add: Address, to_remove: Option<Address>) {
-        storage::extend_instance(&e);
-        emissions::add_to_reward_zone(&e, to_add.clone(), to_remove.clone());
-
-        BackstopEvents::rw_zone_add(&e, to_add, to_remove);
+        panic_with_error!(&e, BackstopError::BadRequest);
     }
 
     fn remove_reward(e: Env, to_remove: Address) {
-        storage::extend_instance(&e);
-        emissions::remove_from_reward_zone(&e, to_remove.clone());
-
-        BackstopEvents::rw_zone_remove(&e, to_remove);
+        panic_with_error!(&e, BackstopError::BadRequest);
     }
 
-    fn claim(e: Env, from: Address, pool_addresses: Vec<Address>, to: Address) -> i128 {
-        storage::extend_instance(&e);
-        from.require_auth();
-
-        let amount = emissions::execute_claim(&e, &from, &pool_addresses, &to);
-
-        BackstopEvents::claim(&e, from, amount);
-        amount
+    fn claim(e: Env, from: Address, pool_addresses: Vec<Address>, min_lp_tokens_out: i128) -> i128 {
+        panic_with_error!(&e, BackstopError::BadRequest);
     }
 
     fn drop(e: Env) {
-        let mut drop_list = storage::get_drop_list(&e);
-        let backfilled_emissions = storage::get_backfill_emissions(&e);
-        drop_list.push_back((e.current_contract_address(), backfilled_emissions));
-        let emitter_client = EmitterClient::new(&e, &storage::get_emitter(&e));
-        emitter_client.drop(&drop_list)
+        panic_with_error!(&e, BackstopError::BadRequest);
     }
 
     /********** Fund Management *********/

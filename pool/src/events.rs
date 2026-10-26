@@ -1,9 +1,12 @@
+#[cfg(not(feature = "certora"))]
 use soroban_sdk::{Address, Env, Symbol, Vec};
 
+#[cfg(not(feature = "certora"))]
 use crate::{AuctionData, ReserveConfig};
 
 pub struct PoolEvents {}
 
+#[cfg(not(feature = "certora"))]
 impl PoolEvents {
     /// Emitted when a new admin is set for a pool
     ///
@@ -161,15 +164,44 @@ impl PoolEvents {
 
     /// Emitted when bad debt is defaulted
     ///
-    /// - topics - `["defaulted_debt", asset: Address]`
+    /// - topics - `["defaulted_debt", user: Address, asset: Address]`
     /// - data - `[d_tokens_burnt: i128]`
     ///
     /// ### Arguments
+    /// * user - The address whose liability was defaulted
     /// * asset - The asset with defaulted debt
     /// * d_tokens_burnt - The amount of defaulted d_tokens
-    pub fn defaulted_debt(e: &Env, asset: Address, d_tokens_burnt: i128) {
-        let topics = (Symbol::new(e, "defaulted_debt"), asset);
+    pub fn defaulted_debt(e: &Env, user: Address, asset: Address, d_tokens_burnt: i128) {
+        let topics = (Symbol::new(e, "defaulted_debt"), user, asset);
         e.events().publish(topics, d_tokens_burnt);
+    }
+
+    /// Topics: `["debt_setoff", user, asset]`; data: `(b_tokens_burned, d_tokens_repaid)`.
+    ///
+    /// Emitted when a defaulting user's own noncollateral supply in the debt reserve is
+    /// burned to repay that reserve's liability before any residual is defaulted.
+    pub fn debt_setoff(
+        e: &Env,
+        user: Address,
+        asset: Address,
+        b_tokens_burned: i128,
+        d_tokens_repaid: i128,
+    ) {
+        let topics = (Symbol::new(e, "debt_setoff"), user, asset);
+        e.events()
+            .publish(topics, (b_tokens_burned, d_tokens_repaid));
+    }
+
+    /// Topics: `["collateral_orphaned", user, asset]`; data: orphaned b-token amount.
+    pub fn collateral_orphaned(e: &Env, user: Address, asset: Address, b_tokens: i128) {
+        let topics = (Symbol::new(e, "collateral_orphaned"), user, asset);
+        e.events().publish(topics, b_tokens);
+    }
+
+    /// Topics: `["orphan_settled", asset]`; data: burned pool-owned b-token amount.
+    pub fn orphan_settled(e: &Env, asset: Address, b_tokens: i128) {
+        let topics = (Symbol::new(e, "orphan_settled"), asset);
+        e.events().publish(topics, b_tokens);
     }
 
     /// Emitted when tokens are supplied
@@ -303,23 +335,22 @@ impl PoolEvents {
         e.events().publish(topics, (tokens_out, d_tokens_minted));
     }
 
-    /// Emitted when a reserve updates its bToken rate
+    /// Emitted when a reserve gulps excess tokens
     ///
     /// - topics - `["gulp", asset: Address]`
-    /// - data - `[token_delta: i128, new_b_rate: i128]`
+    /// - data - `[token_delta: i128]`
     ///
     /// ### Arguments
     /// * asset - The asset
-    /// * token_delta - The change in token balance
-    /// * new_b_rate - The new b rate
-    pub fn gulp(e: &Env, asset: Address, token_delta: i128, new_b_rate: i128) {
+    /// * token_delta - The number of tokens gulped
+    pub fn gulp(e: &Env, asset: Address, token_delta: i128) {
         let topics = (Symbol::new(e, "gulp"), asset);
-        e.events().publish(topics, (token_delta, new_b_rate));
+        e.events().publish(topics, token_delta);
     }
 
     /// Emitted when a new auction is created
     ///
-    /// - topics - `["new_auction", user: Address, auction_type: u32]`
+    /// - topics - `["new_auction", auction_type: u32, user: Address]`
     /// - data - `[percent: u32, auction_data: AuctionData]`
     ///
     /// ### Arguments
@@ -340,7 +371,7 @@ impl PoolEvents {
 
     /// Emitted when an auction is filled
     ///
-    /// - topics - `["fill_auction", user: Address, auction_type: u32]`
+    /// - topics - `["fill_auction", auction_type: u32, user: Address]`
     /// - data - `[filler: Address, fill_percent: i128, filled_auction_data: AuctionData]`
     ///
     /// ### Arguments
@@ -362,15 +393,16 @@ impl PoolEvents {
             .publish(topics, (filler, fill_percent, filled_auction_data));
     }
 
-    /// Emitted when a liquidation auction is deleted
+    /// Emitted when an auction is deleted
     ///
-    /// - topics - `["delete_liquidation_auction", from: Address]`
+    /// - topics - `["delete_auction", auction_type: u32, user: Address]`
     /// - data - `()`
     ///
     /// ### Arguments
-    /// * from - The address of the liquidated user
-    pub fn delete_liquidation_auction(e: &Env, from: Address) {
-        let topics = (Symbol::new(&e, "delete_liquidation_auction"), from);
+    /// * auction_type - The type of auction
+    /// * user - The address of the user
+    pub fn delete_auction(e: &Env, auction_type: u32, user: Address) {
+        let topics = (Symbol::new(&e, "delete_auction"), auction_type, user);
         e.events().publish(topics, ());
     }
 }

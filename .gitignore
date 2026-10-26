@@ -1,0 +1,23 @@
+/target
+.DS_Store
+**/.DS_Store
+
+test_snapshots/
+
+# JS
+*/node_modules
+local.*
+
+/js
+
+# Devenv
+.devenv*
+devenv.local.nix
+.direnv
+# Certora CLI per-run artifacts: source snapshots, logs, metadata.
+.certora_internal/
+.certora_sources/
+.last_confs/
+
+# Kani harness listing output.
+kani-list.json
